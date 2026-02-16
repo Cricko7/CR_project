@@ -1,0 +1,116 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: cr-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: sim
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d sim"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.5
+    container_name: cr-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cr-sim-backend:local
+    container_name: cr-api
+    command: ["api"]
+    environment:
+      SERVICE_NAME: sim-backend
+      LOG_LEVEL: info
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/sim
+      DATABASE_RUN_MIGRATIONS: "true"
+      API_HOST: 0.0.0.0
+      API_PORT: "8080"
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_COLLECTION: agent_memories
+      MEMORY_EMBED_BATCH_SIZE: "32"
+      MEMORY_MAX_ACTIVE_PER_AGENT: "200"
+      MEMORY_SUMMARY_BATCH_SIZE: "20"
+      MEMORY_EMBED_INTERVAL_MS: "5000"
+      MEMORY_SUMMARY_INTERVAL_MS: "30000"
+      API_EVENT_BRIDGE_INTERVAL_MS: "500"
+      API_EVENT_BRIDGE_BATCH_SIZE: "128"
+      # GEMINI_API_KEY: "<optional>"
+      # GEMINI_MODEL: "gemini-2.0-flash"
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    restart: unless-stopped
+
+  seed:
+    image: postgres:16
+    container_name: cr-seed
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_started
+    volumes:
+      - ./docker/postgres/seed_agents.sql:/seed/seed_agents.sql:ro
+    command:
+      - sh
+      - -c
+      - |
+        until pg_isready -h postgres -U postgres -d sim; do sleep 1; done;
+        until psql postgresql://postgres:postgres@postgres:5432/sim -tAc "SELECT to_regclass('public.agents') IS NOT NULL" | grep -q t; do sleep 1; done;
+        psql postgresql://postgres:postgres@postgres:5432/sim -f /seed/seed_agents.sql;
+
+  worker:
+    image: cr-sim-backend:local
+    container_name: cr-worker
+    command: ["worker"]
+    environment:
+      SERVICE_NAME: sim-worker
+      LOG_LEVEL: info
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/sim
+      DATABASE_RUN_MIGRATIONS: "false"
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_COLLECTION: agent_memories
+      WORKER_AGENT_IDS: 11111111-1111-1111-1111-111111111111,22222222-2222-2222-2222-222222222222
+      WORKER_TICK_INTERVAL_MS: "1000"
+      WORKER_TICK_CONCURRENCY: "8"
+      WORKER_MOOD_DECAY_INTERVAL_MS: "5000"
+      WORKER_MOOD_DECAY_STEP: "0.06"
+      WORKER_MESSAGE_INTERVAL_MS: "1000"
+      WORKER_MESSAGE_BATCH_SIZE: "32"
+      MEMORY_EMBED_BATCH_SIZE: "32"
+      MEMORY_MAX_ACTIVE_PER_AGENT: "200"
+      MEMORY_SUMMARY_BATCH_SIZE: "20"
+      MEMORY_EMBED_INTERVAL_MS: "5000"
+      MEMORY_SUMMARY_INTERVAL_MS: "30000"
+      # GEMINI_API_KEY: "<optional>"
+      # GEMINI_MODEL: "gemini-2.0-flash"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      seed:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  qdrant_data:

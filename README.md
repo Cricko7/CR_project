@@ -166,6 +166,11 @@ flowchart LR
 
 ```text
 CR_project/
+├── Dockerfile                      # unified runtime image (api/worker)
+├── docker-compose.yml              # one-command full stack run
+├── docker/
+│   └── postgres/
+│       └── seed_agents.sql         # auto-seed demo agents
 ├── Cargo.toml                      # workspace
 ├── crates/
 │   ├── api/
@@ -871,6 +876,39 @@ Payload в point:
 ---
 
 ## 11. Локальный запуск (с нуля)
+
+### 11.0 One-command Docker запуск (рекомендуется)
+
+Требования:
+- Docker Desktop (или Docker Engine + Compose plugin).
+
+Одна команда, чтобы поднять весь стек:
+```bash
+docker compose up --build -d
+```
+
+Что поднимется:
+- `postgres` (DB)
+- `qdrant` (vector DB)
+- `api` (HTTP + WS)
+- `seed` (одноразовый импорт 2 агентов: Alice/Bob)
+- `worker` (тики, message delivery, embedding, summarization, mood decay)
+
+Быстрая проверка:
+```bash
+curl http://127.0.0.1:8080/health
+curl "http://127.0.0.1:8080/events?limit=5"
+```
+
+Остановить и удалить контейнеры:
+```bash
+docker compose down
+```
+
+Остановить с удалением volume данных:
+```bash
+docker compose down -v
+```
 
 ### 11.1 Prerequisites
 - Rust stable toolchain;
