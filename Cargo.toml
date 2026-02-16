@@ -1,0 +1,22 @@
+[workspace]
+members = ["crates/api", "crates/sim-backend", "crates/worker"]
+resolver = "2"
+
+[workspace.dependencies]
+anyhow = "1.0.98"
+axum = { version = "0.8.4", features = ["ws"] }
+serde = { version = "1.0.219", features = ["derive"] }
+tokio = { version = "1.44.1", features = [
+  "macros",
+  "rt-multi-thread",
+  "sync",
+  "time",
+  "signal",
+] }
+tokio-util = "0.7.15"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = [
+  "env-filter",
+  "fmt",
+  "json",
+] }
