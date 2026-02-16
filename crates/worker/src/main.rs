@@ -1,11 +1,13 @@
 use sim_backend::app::config::WorkerConfig;
 use sim_backend::app::observability::init_tracing;
 use sim_backend::app::runtime::ServiceRuntime;
+use sim_backend::infrastructure::postgres::ensure_ready;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let config = WorkerConfig::from_env()?;
     init_tracing(&config.common.service_name, &config.common.log_level)?;
+    let _db_pool = ensure_ready(&config.database).await?;
 
     let mut runtime = ServiceRuntime::new(
         config.common.service_name.clone(),

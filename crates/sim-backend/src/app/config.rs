@@ -11,6 +11,12 @@ const DEFAULT_API_PORT: u16 = 8080;
 const DEFAULT_SHUTDOWN_TIMEOUT_MS: u64 = 15_000;
 const DEFAULT_WORKER_TICK_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_MOOD_DECAY_INTERVAL_MS: u64 = 5_000;
+const DEFAULT_DATABASE_MAX_CONNECTIONS: u32 = 10;
+const DEFAULT_DATABASE_CONNECT_TIMEOUT_MS: u64 = 5_000;
+const DEFAULT_DATABASE_ACQUIRE_TIMEOUT_MS: u64 = 5_000;
+const DEFAULT_DATABASE_IDLE_TIMEOUT_MS: u64 = 60_000;
+const DEFAULT_DATABASE_MAX_LIFETIME_MS: u64 = 300_000;
+const DEFAULT_DATABASE_RUN_MIGRATIONS: bool = false;
 
 #[derive(Debug, Clone)]
 pub struct CommonConfig {
@@ -20,8 +26,20 @@ pub struct CommonConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct DatabaseConfig {
+    pub url: String,
+    pub max_connections: u32,
+    pub connect_timeout: Duration,
+    pub acquire_timeout: Duration,
+    pub idle_timeout: Duration,
+    pub max_lifetime: Duration,
+    pub run_migrations: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct ApiConfig {
     pub common: CommonConfig,
+    pub database: DatabaseConfig,
     pub host: IpAddr,
     pub port: u16,
 }
@@ -29,6 +47,7 @@ pub struct ApiConfig {
 impl ApiConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
         let common = load_common_config(DEFAULT_SERVICE_NAME)?;
+        let database = load_database_config()?;
         let host_raw: String = parse_env("API_HOST", DEFAULT_HOST.to_owned())?;
         let host = host_raw
             .parse::<IpAddr>()
@@ -38,7 +57,12 @@ impl ApiConfig {
             return Err(ConfigError::invalid("API_PORT", "must be greater than 0"));
         }
 
-        Ok(Self { common, host, port })
+        Ok(Self {
+            common,
+            database,
+            host,
+            port,
+        })
     }
 
     pub fn socket_addr(&self) -> SocketAddr {
@@ -49,6 +73,7 @@ impl ApiConfig {
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
     pub common: CommonConfig,
+    pub database: DatabaseConfig,
     pub tick_interval: Duration,
     pub mood_decay_interval: Duration,
 }
@@ -56,6 +81,7 @@ pub struct WorkerConfig {
 impl WorkerConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
         let common = load_common_config("sim-worker")?;
+        let database = load_database_config()?;
         let tick_interval_ms: u64 =
             parse_env("WORKER_TICK_INTERVAL_MS", DEFAULT_WORKER_TICK_INTERVAL_MS)?;
         let mood_decay_interval_ms: u64 =
@@ -76,6 +102,7 @@ impl WorkerConfig {
 
         Ok(Self {
             common,
+            database,
             tick_interval: Duration::from_millis(tick_interval_ms),
             mood_decay_interval: Duration::from_millis(mood_decay_interval_ms),
         })
@@ -107,6 +134,75 @@ fn load_common_config(default_service_name: &str) -> Result<CommonConfig, Config
         service_name,
         log_level,
         shutdown_timeout: Duration::from_millis(shutdown_timeout_ms),
+    })
+}
+
+fn load_database_config() -> Result<DatabaseConfig, ConfigError> {
+    let url = env::var("DATABASE_URL")
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_default();
+    if url.is_empty() {
+        return Err(ConfigError::invalid("DATABASE_URL", "must not be empty"));
+    }
+
+    let max_connections: u32 = parse_env("DATABASE_MAX_CONNECTIONS", DEFAULT_DATABASE_MAX_CONNECTIONS)?;
+    if max_connections == 0 {
+        return Err(ConfigError::invalid(
+            "DATABASE_MAX_CONNECTIONS",
+            "must be greater than 0",
+        ));
+    }
+
+    let connect_timeout_ms: u64 = parse_env(
+        "DATABASE_CONNECT_TIMEOUT_MS",
+        DEFAULT_DATABASE_CONNECT_TIMEOUT_MS,
+    )?;
+    let acquire_timeout_ms: u64 = parse_env(
+        "DATABASE_ACQUIRE_TIMEOUT_MS",
+        DEFAULT_DATABASE_ACQUIRE_TIMEOUT_MS,
+    )?;
+    let idle_timeout_ms: u64 =
+        parse_env("DATABASE_IDLE_TIMEOUT_MS", DEFAULT_DATABASE_IDLE_TIMEOUT_MS)?;
+    let max_lifetime_ms: u64 =
+        parse_env("DATABASE_MAX_LIFETIME_MS", DEFAULT_DATABASE_MAX_LIFETIME_MS)?;
+    let run_migrations: bool = parse_env(
+        "DATABASE_RUN_MIGRATIONS",
+        DEFAULT_DATABASE_RUN_MIGRATIONS,
+    )?;
+
+    if connect_timeout_ms == 0 {
+        return Err(ConfigError::invalid(
+            "DATABASE_CONNECT_TIMEOUT_MS",
+            "must be greater than 0",
+        ));
+    }
+    if acquire_timeout_ms == 0 {
+        return Err(ConfigError::invalid(
+            "DATABASE_ACQUIRE_TIMEOUT_MS",
+            "must be greater than 0",
+        ));
+    }
+    if idle_timeout_ms == 0 {
+        return Err(ConfigError::invalid(
+            "DATABASE_IDLE_TIMEOUT_MS",
+            "must be greater than 0",
+        ));
+    }
+    if max_lifetime_ms == 0 {
+        return Err(ConfigError::invalid(
+            "DATABASE_MAX_LIFETIME_MS",
+            "must be greater than 0",
+        ));
+    }
+
+    Ok(DatabaseConfig {
+        url,
+        max_connections,
+        connect_timeout: Duration::from_millis(connect_timeout_ms),
+        acquire_timeout: Duration::from_millis(acquire_timeout_ms),
+        idle_timeout: Duration::from_millis(idle_timeout_ms),
+        max_lifetime: Duration::from_millis(max_lifetime_ms),
+        run_migrations,
     })
 }
 

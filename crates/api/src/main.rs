@@ -9,6 +9,7 @@ use serde::Serialize;
 use sim_backend::app::config::ApiConfig;
 use sim_backend::app::observability::init_tracing;
 use sim_backend::app::runtime::ServiceRuntime;
+use sim_backend::infrastructure::postgres::ensure_ready;
 
 #[derive(Clone)]
 struct ApiState {
@@ -25,6 +26,9 @@ struct HealthResponse {
 async fn main() -> anyhow::Result<()> {
     let config = ApiConfig::from_env().context("failed to load API config")?;
     init_tracing(&config.common.service_name, &config.common.log_level)?;
+    let _db_pool = ensure_ready(&config.database)
+        .await
+        .context("database startup check failed")?;
 
     let mut runtime = ServiceRuntime::new(
         config.common.service_name.clone(),
