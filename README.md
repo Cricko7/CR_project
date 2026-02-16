@@ -21,7 +21,7 @@ Backend для симуляции мира автономных AI-агенто�
 | Требование | Статус | Что есть сейчас |
 |---|---|---|
 | 1. Долговременная память (vector DB + summarization) | `FULLY IMPLEMENTED` | Реализованы `memory_entries`, embedding pipeline с retry+DLQ, Qdrant recall, архивирование старых воспоминаний, авто-суммаризация overflow, API для dead-letter requeue |
-| 2. Эмоциональный интеллект | `PARTIAL` | Поля valence/arousal/mood есть, но динамика эмоций и mood decay пока не реализованы (воркер-заглушка) |
+| 2. Эмоциональный интеллект | `FULLY IMPLEMENTED` | Реализована динамика эмоций на каждом тике (summary + personality traits -> valence/arousal/mood), а также периодический mood decay к нейтрали в worker |
 | 3. Архитектура агента (рефлексия→цель→действие) | `PARTIAL` | Есть tick orchestrator + LLM summary, но отдельные стадии планирования пока не декомпозированы |
 | 4. Мультиагентность (общение, отношения) | `PARTIAL` | Таблицы `messages`, `relationships` есть; процессинг межагентных сообщений/обновления отношений пока не поднят |
 | 5. Real-time dashboard life feed | `PARTIAL` | Есть `/events` + `/ws/events`; живой WS-пуш пока только для тиков, инициированных через API |
@@ -119,7 +119,8 @@ flowchart LR
 
 ### Emotions
 - Текущее состояние:
-  - хранятся `valence/arousal/mood_label`, но evolution logic почти отсутствует.
+  - `valence/arousal/mood_label` обновляются на каждом тике через emotional model (action summary + personality bias);
+  - отдельный worker выполняет периодический mood decay к нейтральному состоянию.
 
 ### Interventions
 - Текущее состояние:
@@ -197,8 +198,9 @@ CR_project/
    - concurrent tick для одного агента в пределах одного процесса.
 4. Orchestrator:
    - читает agent + state;
-   - upsert state;
    - генерирует action summary (Gemini или fallback);
+   - пересчитывает `valence/arousal/mood_label` на основе summary и personality traits;
+   - upsert state;
    - пишет event в `events`.
 5. После завершения (success/error) tick id фиксируется в persisted history, lease освобождается.
 6. После успешного тика сервис пытается append memory с текстом результата.
@@ -587,6 +589,7 @@ Payload в point:
 | `WORKER_TICK_INTERVAL_MS` | `1000` |
 | `WORKER_TICK_CONCURRENCY` | `8` |
 | `WORKER_MOOD_DECAY_INTERVAL_MS` | `5000` |
+| `WORKER_MOOD_DECAY_STEP` | `0.06` |
 
 ---
 
@@ -618,6 +621,7 @@ set API_HOST=127.0.0.1
 set API_PORT=8080
 set WORKER_AGENT_IDS=<uuid1>,<uuid2>
 set WORKER_TICK_CONCURRENCY=8
+set WORKER_MOOD_DECAY_STEP=0.06
 set GEMINI_API_KEY=<your_google_api_key>
 ```
 
@@ -739,7 +743,7 @@ VALUES
 7. Qdrant adapter и Gemini adapters.
 8. REST endpoints для state/events/memory/ticks.
 9. WebSocket endpoint с snapshot + live events.
-10. Worker циклы: ticks, mood-decay (stub), embedding, summarization.
+10. Worker циклы: ticks, mood-decay, embedding, summarization.
 11. Миграции для базовой схемы, long-term memory и concurrency/failure hardening.
 12. Unit tests для `agent_core` и `memory`.
 
@@ -757,7 +761,7 @@ VALUES
    - agent inspector aggregate endpoint.
 3. Поднять event bus для межагентных сообщений (Redis Streams/NATS) либо простой DB outbox + worker-consumer.
 4. Сделать live updates для worker-событий в WS через общий pub/sub, а не process-local hub.
-5. Реализовать эмоциональные переходы (из событий в mood update).
+5. Доработать policy-слой эмоционального интеллекта (domain-specific rules per world/agent class).
 
 ### P1 (нужно для полноты симуляции)
 1. Разделить tick pipeline на этапы:
@@ -813,6 +817,7 @@ VALUES
 - memory recall работает только для `embedded` записей;
 - summary-память создается как отдельная запись и архивирует source;
 - mood/state валидны в диапазоне `[-1.0, 1.0]` (clamp в orchestrator);
+- mood обновляется на тике через summary+personality model и постепенно затухает к нейтрали в mood-decay worker;
 - duplicate/busy tick защита есть и process-local, и cross-process через Postgres lease/idempotency;
 - `embedding_status` цикл: `pending -> processing -> embedded | pending(retry) | dead_letter`.
 

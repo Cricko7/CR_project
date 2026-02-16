@@ -17,6 +17,9 @@ const DEFAULT_TICK_HISTORY_PER_AGENT: usize = 256;
 const DEFAULT_TICK_LEASE_TTL: Duration = Duration::from_secs(90);
 const LLM_SUMMARY_MAX_CHARS: usize = 512;
 const EVENT_DESCRIPTION_MAX_CHARS: usize = 180;
+const EMOTION_INERTIA_VALENCE: f32 = 0.72;
+const EMOTION_INERTIA_AROUSAL: f32 = 0.68;
+const EMOTION_MAX_PERSONALITY_BIAS: f32 = 0.08;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentTickExecutionStatus {
@@ -170,7 +173,7 @@ async fn execute_tick(
     let now = Utc::now();
     let current_state = repository.get_agent_state(agent_id).await?;
 
-    let (next_valence, next_arousal, next_mood) = match current_state {
+    let (previous_valence, previous_arousal, previous_mood) = match current_state {
         Some(state) => (
             state.valence.clamp(-1.0, 1.0),
             state.arousal.clamp(-1.0, 1.0),
@@ -178,6 +181,24 @@ async fn execute_tick(
         ),
         None => (0.0, 0.0, "neutral".to_owned()),
     };
+
+    let (action_summary, llm_used, llm_model, llm_error, llm_latency_ms) = generate_action_summary(
+        llm.as_deref(),
+        &agent.name,
+        &agent.personality_json,
+        tick_id,
+        &previous_mood,
+        previous_valence,
+        previous_arousal,
+    )
+    .await;
+
+    let (next_valence, next_arousal, next_mood) = evolve_emotional_state(
+        previous_valence,
+        previous_arousal,
+        &action_summary,
+        &agent.personality_json,
+    );
 
     repository
         .upsert_agent_state(&AgentStateRecord {
@@ -188,17 +209,6 @@ async fn execute_tick(
             updated_at: now,
         })
         .await?;
-
-    let (action_summary, llm_used, llm_model, llm_error, llm_latency_ms) = generate_action_summary(
-        llm.as_deref(),
-        &agent.name,
-        &agent.personality_json,
-        tick_id,
-        &next_mood,
-        next_valence,
-        next_arousal,
-    )
-    .await;
 
     let description = format!(
         "Agent `{}` executed tick `{}`: {}",
@@ -218,6 +228,22 @@ async fn execute_tick(
                 "mood_label": next_mood,
                 "valence": next_valence,
                 "arousal": next_arousal,
+                "emotion": {
+                    "previous": {
+                        "mood_label": previous_mood,
+                        "valence": previous_valence,
+                        "arousal": previous_arousal,
+                    },
+                    "next": {
+                        "mood_label": next_mood,
+                        "valence": next_valence,
+                        "arousal": next_arousal,
+                    },
+                    "delta": {
+                        "valence": next_valence - previous_valence,
+                        "arousal": next_arousal - previous_arousal,
+                    }
+                },
                 "action_summary": action_summary,
                 "llm": {
                     "configured": llm.is_some(),
@@ -317,6 +343,150 @@ fn fallback_summary(agent_name: &str, mood_label: &str) -> String {
     format!(
         "{agent_name} stays {mood_label} and continues a routine social action in the environment."
     )
+}
+
+fn evolve_emotional_state(
+    previous_valence: f32,
+    previous_arousal: f32,
+    action_summary: &str,
+    personality_json: &Value,
+) -> (f32, f32, String) {
+    let (summary_valence_delta, summary_arousal_delta) = summary_emotion_delta(action_summary);
+    let (personality_valence_bias, personality_arousal_bias) =
+        personality_emotion_bias(personality_json);
+
+    let next_valence = (previous_valence * EMOTION_INERTIA_VALENCE
+        + summary_valence_delta
+        + personality_valence_bias)
+        .clamp(-1.0, 1.0);
+    let next_arousal = (previous_arousal * EMOTION_INERTIA_AROUSAL
+        + summary_arousal_delta
+        + personality_arousal_bias)
+        .clamp(-1.0, 1.0);
+
+    let next_mood = classify_mood(next_valence, next_arousal);
+    (next_valence, next_arousal, next_mood)
+}
+
+fn summary_emotion_delta(summary: &str) -> (f32, f32) {
+    let normalized = summary.to_lowercase();
+    let positive_hits = keyword_hits(
+        &normalized,
+        &[
+            "cooperate",
+            "cooperative",
+            "support",
+            "friend",
+            "help",
+            "discover",
+            "succeed",
+            "trust",
+            "calm",
+            "joy",
+            "progress",
+            "resolve",
+        ],
+    );
+    let negative_hits = keyword_hits(
+        &normalized,
+        &[
+            "conflict", "argue", "fail", "threat", "danger", "panic", "fear", "angry", "sad",
+            "stress", "attack", "loss",
+        ],
+    );
+    let high_arousal_hits = keyword_hits(
+        &normalized,
+        &[
+            "urgent", "quickly", "danger", "conflict", "panic", "excited", "intense", "rush",
+            "alert",
+        ],
+    );
+    let low_arousal_hits = keyword_hits(
+        &normalized,
+        &[
+            "calm", "steady", "routine", "rest", "observe", "reflect", "slow", "quiet",
+        ],
+    );
+
+    let valence_delta = ((positive_hits as f32 - negative_hits as f32) * 0.07).clamp(-0.25, 0.25);
+    let arousal_delta =
+        ((high_arousal_hits as f32 - low_arousal_hits as f32) * 0.06).clamp(-0.24, 0.24);
+    (valence_delta, arousal_delta)
+}
+
+fn personality_emotion_bias(personality_json: &Value) -> (f32, f32) {
+    let mut valence_bias: f32 = 0.0;
+    let mut arousal_bias: f32 = 0.0;
+    for trait_name in extract_personality_traits(personality_json) {
+        match trait_name.as_str() {
+            "optimistic" | "friendly" | "empathetic" | "cooperative" => valence_bias += 0.03,
+            "curious" | "adventurous" => {
+                valence_bias += 0.02;
+                arousal_bias += 0.02;
+            }
+            "anxious" | "neurotic" => {
+                valence_bias -= 0.03;
+                arousal_bias += 0.04;
+            }
+            "calm" | "patient" => {
+                valence_bias += 0.01;
+                arousal_bias -= 0.03;
+            }
+            "aggressive" => {
+                valence_bias -= 0.02;
+                arousal_bias += 0.05;
+            }
+            "sarcastic" => valence_bias -= 0.01,
+            _ => {}
+        }
+    }
+
+    (
+        valence_bias.clamp(-EMOTION_MAX_PERSONALITY_BIAS, EMOTION_MAX_PERSONALITY_BIAS),
+        arousal_bias.clamp(-EMOTION_MAX_PERSONALITY_BIAS, EMOTION_MAX_PERSONALITY_BIAS),
+    )
+}
+
+fn extract_personality_traits(personality_json: &Value) -> Vec<String> {
+    let Some(traits) = personality_json.get("traits").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    traits
+        .iter()
+        .filter_map(Value::as_str)
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+fn keyword_hits(input: &str, keywords: &[&str]) -> usize {
+    keywords.iter().filter(|word| input.contains(*word)).count()
+}
+
+pub fn classify_mood(valence: f32, arousal: f32) -> String {
+    if valence >= 0.45 && arousal >= 0.35 {
+        return "excited".to_owned();
+    }
+    if valence >= 0.45 && arousal <= -0.2 {
+        return "content".to_owned();
+    }
+    if valence >= 0.2 && arousal <= 0.3 {
+        return "calm".to_owned();
+    }
+    if valence <= -0.45 && arousal >= 0.35 {
+        return "angry".to_owned();
+    }
+    if valence <= -0.35 && arousal <= -0.15 {
+        return "sad".to_owned();
+    }
+    if arousal >= 0.6 && valence.abs() < 0.2 {
+        return "anxious".to_owned();
+    }
+    if arousal <= -0.45 && valence.abs() < 0.2 {
+        return "tired".to_owned();
+    }
+    "neutral".to_owned()
 }
 
 fn trim_text(input: &str, max_chars: usize) -> String {
@@ -630,6 +800,7 @@ mod tests {
             event.payload_json["action_summary"],
             "Plans a cooperative conversation."
         );
+        assert!(event.payload_json["valence"].as_f64().unwrap_or_default() > 0.0);
     }
 
     #[tokio::test]
@@ -669,7 +840,83 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn updates_emotion_state_from_action_summary() {
+        let repository = Arc::new(InMemoryAgentCoreRepository::default());
+        let agent_id = Uuid::new_v4();
+        seed_agent(repository.as_ref(), agent_id, "Em").await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let llm: Arc<dyn LlmPort> = Arc::new(StubLlm::success(
+            "Faced urgent conflict and danger, reacts quickly.",
+            Arc::clone(&calls),
+        ));
+
+        let orchestrator =
+            AgentTickOrchestrator::new(repository.clone()).with_optional_llm(Some(llm));
+        let outcome = orchestrator
+            .run_agent_tick(agent_id, Some("tick-emotion-shift".to_owned()))
+            .await
+            .expect("tick should execute");
+
+        let AgentTickOrchestratorOutcome::Executed(result) = outcome else {
+            panic!("expected executed outcome");
+        };
+
+        assert!(result.arousal > 0.0);
+        assert!(result.valence < 0.0);
+        assert!(["angry", "anxious", "neutral"].contains(&result.mood_label.as_str()));
+    }
+
+    #[tokio::test]
+    async fn applies_personality_bias_to_emotion_dynamics() {
+        let repository = Arc::new(InMemoryAgentCoreRepository::default());
+        let agent_id = Uuid::new_v4();
+        seed_agent_with_personality(
+            repository.as_ref(),
+            agent_id,
+            "Bias",
+            serde_json::json!({ "traits": ["anxious"] }),
+        )
+        .await;
+
+        let orchestrator = AgentTickOrchestrator::new(repository);
+        let outcome = orchestrator
+            .run_agent_tick(agent_id, Some("tick-personality-bias".to_owned()))
+            .await
+            .expect("tick should execute");
+
+        let AgentTickOrchestratorOutcome::Executed(result) = outcome else {
+            panic!("expected executed outcome");
+        };
+
+        assert!(result.valence < 0.0);
+    }
+
+    #[test]
+    fn classifies_core_mood_buckets() {
+        assert_eq!(super::classify_mood(0.6, 0.5), "excited");
+        assert_eq!(super::classify_mood(-0.6, 0.6), "angry");
+        assert_eq!(super::classify_mood(-0.5, -0.3), "sad");
+        assert_eq!(super::classify_mood(0.1, -0.6), "tired");
+        assert_eq!(super::classify_mood(0.0, 0.0), "neutral");
+    }
+
     async fn seed_agent(repository: &InMemoryAgentCoreRepository, agent_id: Uuid, name: &str) {
+        seed_agent_with_personality(
+            repository,
+            agent_id,
+            name,
+            Value::Object(Default::default()),
+        )
+        .await;
+    }
+
+    async fn seed_agent_with_personality(
+        repository: &InMemoryAgentCoreRepository,
+        agent_id: Uuid,
+        name: &str,
+        personality_json: Value,
+    ) {
         let mut agents = repository.agents.lock().await;
         agents.insert(
             agent_id,
@@ -677,7 +924,7 @@ mod tests {
                 id: agent_id,
                 name: name.to_owned(),
                 avatar_url: None,
-                personality_json: Value::Object(Default::default()),
+                personality_json,
                 created_at: Utc::now(),
             },
         );

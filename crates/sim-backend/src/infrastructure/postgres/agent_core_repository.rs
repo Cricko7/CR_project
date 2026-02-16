@@ -22,6 +22,63 @@ impl PostgresAgentCoreRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
+
+    pub async fn apply_global_mood_decay(&self, step: f32) -> Result<u64> {
+        let step = step.clamp(0.0001, 1.0);
+        let result = sqlx::query(
+            r#"
+            WITH next_values AS (
+                SELECT
+                    agent_id,
+                    CASE
+                        WHEN ABS(valence) <= $1 THEN 0.0
+                        ELSE valence - SIGN(valence) * $1
+                    END AS next_valence,
+                    CASE
+                        WHEN ABS(arousal) <= $1 THEN 0.0
+                        ELSE arousal - SIGN(arousal) * $1
+                    END AS next_arousal
+                FROM agent_states
+            ),
+            classified AS (
+                SELECT
+                    agent_id,
+                    next_valence,
+                    next_arousal,
+                    CASE
+                        WHEN next_valence >= 0.45 AND next_arousal >= 0.35 THEN 'excited'
+                        WHEN next_valence >= 0.45 AND next_arousal <= -0.2 THEN 'content'
+                        WHEN next_valence >= 0.2 AND next_arousal <= 0.3 THEN 'calm'
+                        WHEN next_valence <= -0.45 AND next_arousal >= 0.35 THEN 'angry'
+                        WHEN next_valence <= -0.35 AND next_arousal <= -0.15 THEN 'sad'
+                        WHEN next_arousal >= 0.6 AND ABS(next_valence) < 0.2 THEN 'anxious'
+                        WHEN next_arousal <= -0.45 AND ABS(next_valence) < 0.2 THEN 'tired'
+                        ELSE 'neutral'
+                    END AS next_mood_label
+                FROM next_values
+            )
+            UPDATE agent_states AS state
+            SET
+                valence = classified.next_valence,
+                arousal = classified.next_arousal,
+                mood_label = classified.next_mood_label,
+                updated_at = NOW()
+            FROM classified
+            WHERE state.agent_id = classified.agent_id
+              AND (
+                    state.valence IS DISTINCT FROM classified.next_valence
+                 OR state.arousal IS DISTINCT FROM classified.next_arousal
+                 OR state.mood_label IS DISTINCT FROM classified.next_mood_label
+              )
+            "#,
+        )
+        .bind(step)
+        .execute(&self.pool)
+        .await
+        .context("failed to apply global mood decay")?;
+
+        Ok(result.rows_affected())
+    }
 }
 
 #[async_trait]

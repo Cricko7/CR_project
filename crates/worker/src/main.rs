@@ -54,8 +54,8 @@ async fn main() -> anyhow::Result<()> {
         config.qdrant.vector_size as usize,
     ));
 
-    let repository: Arc<dyn AgentCoreRepository> =
-        Arc::new(PostgresAgentCoreRepository::new(db_pool));
+    let postgres_agent_repository = Arc::new(PostgresAgentCoreRepository::new(db_pool));
+    let repository: Arc<dyn AgentCoreRepository> = postgres_agent_repository.clone();
     let orchestrator = AgentTickOrchestrator::new(repository).with_optional_llm(gemini_client);
 
     let mut runtime = ServiceRuntime::new(
@@ -112,6 +112,8 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let mood_decay_interval = config.mood_decay_interval;
+    let mood_decay_step = config.mood_decay_step;
+    let mood_decay_repository = postgres_agent_repository.clone();
     let mood_token = cancellation.clone();
     runtime.spawn("mood_decay_worker", async move {
         let mut interval = tokio::time::interval(mood_decay_interval);
@@ -122,7 +124,18 @@ async fn main() -> anyhow::Result<()> {
                     break;
                 }
                 _ = interval.tick() => {
-                    tracing::debug!("mood decay tick");
+                    match mood_decay_repository.apply_global_mood_decay(mood_decay_step).await {
+                        Ok(updated) => {
+                            tracing::debug!(
+                                updated_states = updated,
+                                decay_step = mood_decay_step,
+                                "mood decay tick applied"
+                            );
+                        }
+                        Err(error) => {
+                            tracing::error!(error = %error, "mood decay worker failed");
+                        }
+                    }
                 }
             }
         }

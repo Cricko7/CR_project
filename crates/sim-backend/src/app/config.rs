@@ -14,6 +14,7 @@ const DEFAULT_SHUTDOWN_TIMEOUT_MS: u64 = 15_000;
 const DEFAULT_WORKER_TICK_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_WORKER_TICK_CONCURRENCY: u32 = 8;
 const DEFAULT_MOOD_DECAY_INTERVAL_MS: u64 = 5_000;
+const DEFAULT_MOOD_DECAY_STEP: f32 = 0.06;
 const DEFAULT_DATABASE_MAX_CONNECTIONS: u32 = 10;
 const DEFAULT_DATABASE_CONNECT_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_DATABASE_ACQUIRE_TIMEOUT_MS: u64 = 5_000;
@@ -137,6 +138,7 @@ pub struct WorkerConfig {
     pub tick_interval: Duration,
     pub tick_concurrency: u32,
     pub mood_decay_interval: Duration,
+    pub mood_decay_step: f32,
 }
 
 impl WorkerConfig {
@@ -155,6 +157,7 @@ impl WorkerConfig {
             "WORKER_MOOD_DECAY_INTERVAL_MS",
             DEFAULT_MOOD_DECAY_INTERVAL_MS,
         )?;
+        let mood_decay_step: f32 = parse_env("WORKER_MOOD_DECAY_STEP", DEFAULT_MOOD_DECAY_STEP)?;
 
         if tick_interval_ms == 0 {
             return Err(ConfigError::invalid(
@@ -174,6 +177,12 @@ impl WorkerConfig {
                 "must be greater than 0",
             ));
         }
+        if !(0.0..=1.0).contains(&mood_decay_step) || mood_decay_step == 0.0 {
+            return Err(ConfigError::invalid(
+                "WORKER_MOOD_DECAY_STEP",
+                "must be in range (0.0, 1.0]",
+            ));
+        }
 
         Ok(Self {
             common,
@@ -185,6 +194,7 @@ impl WorkerConfig {
             tick_interval: Duration::from_millis(tick_interval_ms),
             tick_concurrency,
             mood_decay_interval: Duration::from_millis(mood_decay_interval_ms),
+            mood_decay_step,
         })
     }
 }
