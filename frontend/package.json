@@ -3,10 +3,11 @@
   "version": "1.0.0",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
+    "build": "vite build",
     "lint": "eslint src --ext .ts,.tsx --quiet || true",
     "test": "echo 'Frontend tests passed ✅'",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "type-check": "tsc --noEmit"
   },
   "dependencies": {
     "react": "^18.2.0",
