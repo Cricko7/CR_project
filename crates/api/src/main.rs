@@ -19,20 +19,37 @@ use sim_backend::app::config::ApiConfig;
 use sim_backend::app::observability::init_tracing;
 use sim_backend::app::runtime::ServiceRuntime;
 use sim_backend::infrastructure::gemini::GeminiClient;
-use sim_backend::infrastructure::postgres::{PostgresAgentCoreRepository, ensure_ready};
+use sim_backend::infrastructure::gemini_embedding::GeminiEmbeddingClient;
+use sim_backend::infrastructure::postgres::{
+    PostgresAgentCoreRepository, PostgresMemoryRepository, ensure_ready,
+};
+use sim_backend::infrastructure::qdrant::QdrantVectorStore;
 use sim_backend::llm::LlmPort;
+use sim_backend::memory::{
+    MemoryRecallItem, MemoryRepository, MemoryService, MemoryVectorStore, SimpleHashEmbedder,
+    TextEmbedder,
+};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
 const EVENT_HUB_CAPACITY: usize = 512;
 const DEFAULT_WS_SNAPSHOT_LIMIT: u32 = 20;
+const DEFAULT_RECALL_TOP_K: u32 = 8;
 
 #[derive(Clone)]
 struct ApiState {
     service_name: String,
     repository: Arc<dyn AgentCoreRepository>,
     orchestrator: AgentTickOrchestrator,
+    memory_service: Arc<MemoryService>,
+    memory_defaults: MemoryRuntimeDefaults,
     event_hub: ApiEventHub,
+}
+
+#[derive(Clone)]
+struct MemoryRuntimeDefaults {
+    summary_max_active: u32,
+    summary_batch_size: u32,
 }
 
 #[derive(Serialize)]
@@ -94,6 +111,64 @@ struct ApiErrorResponse {
 }
 
 #[derive(Deserialize)]
+struct AppendMemoryRequest {
+    content: String,
+    importance: Option<f32>,
+}
+
+#[derive(Serialize)]
+struct AppendMemoryResponse {
+    memory_id: i64,
+    embedding_status: String,
+}
+
+#[derive(Deserialize)]
+struct RecallQuery {
+    query: String,
+    top_k: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct RecallResponse {
+    items: Vec<RecallItemResponse>,
+}
+
+#[derive(Serialize)]
+struct RecallItemResponse {
+    memory_id: i64,
+    score: f32,
+    content: String,
+    summary: Option<String>,
+    importance: f32,
+    created_at: String,
+}
+
+#[derive(Deserialize)]
+struct SummarizeMemoryRequest {
+    max_active: Option<u32>,
+    batch_size: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct SummarizeMemoryResponse {
+    created_summary: bool,
+    source_count: u32,
+    summary_entry_id: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct ProcessEmbeddingsRequest {
+    limit: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct ProcessEmbeddingsResponse {
+    processed: u32,
+    succeeded: u32,
+    failed: u32,
+}
+
+#[derive(Deserialize)]
 struct WsEventsQuery {
     agent_id: Option<Uuid>,
     snapshot_limit: Option<u32>,
@@ -150,6 +225,7 @@ async fn main() -> anyhow::Result<()> {
     let db_pool = ensure_ready(&config.database)
         .await
         .context("database startup check failed")?;
+
     let gemini_client: Option<Arc<dyn LlmPort>> = match config.gemini.clone() {
         Some(gemini_config) => {
             tracing::info!(model = %gemini_config.model, "gemini client configured");
@@ -160,9 +236,28 @@ async fn main() -> anyhow::Result<()> {
             None
         }
     };
+
     let repository: Arc<dyn AgentCoreRepository> =
-        Arc::new(PostgresAgentCoreRepository::new(db_pool));
-    let orchestrator = AgentTickOrchestrator::new(repository.clone()).with_optional_llm(gemini_client);
+        Arc::new(PostgresAgentCoreRepository::new(db_pool.clone()));
+    let orchestrator =
+        AgentTickOrchestrator::new(repository.clone()).with_optional_llm(gemini_client.clone());
+
+    let vector_store: Arc<dyn MemoryVectorStore> =
+        Arc::new(QdrantVectorStore::new(config.qdrant.clone())?);
+    vector_store.ensure_collection().await?;
+    let memory_repository: Arc<dyn MemoryRepository> =
+        Arc::new(PostgresMemoryRepository::new(db_pool));
+    let embedder: Arc<dyn TextEmbedder> = match config.gemini.clone() {
+        Some(gemini_config) => Arc::new(GeminiEmbeddingClient::new(gemini_config)?),
+        None => Arc::new(SimpleHashEmbedder::new(config.qdrant.vector_size as usize)),
+    };
+    let memory_service = Arc::new(MemoryService::new(
+        memory_repository,
+        vector_store,
+        embedder,
+        gemini_client,
+        config.qdrant.vector_size as usize,
+    ));
 
     let mut runtime = ServiceRuntime::new(
         config.common.service_name.clone(),
@@ -174,6 +269,11 @@ async fn main() -> anyhow::Result<()> {
         service_name: config.common.service_name.clone(),
         repository,
         orchestrator,
+        memory_service,
+        memory_defaults: MemoryRuntimeDefaults {
+            summary_max_active: config.memory.max_active_per_agent,
+            summary_batch_size: config.memory.summary_batch_size,
+        },
         event_hub: ApiEventHub::new(EVENT_HUB_CAPACITY),
     };
     let app = Router::new()
@@ -182,6 +282,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/agents/{id}/ticks", post(trigger_agent_tick))
         .route("/agents/{id}/state", get(get_agent_state))
         .route("/events", get(list_events))
+        .route("/agents/{id}/memories", post(append_agent_memory))
+        .route("/agents/{id}/memories/recall", get(recall_agent_memory))
+        .route("/agents/{id}/memories/summarize", post(summarize_agent_memory))
+        .route("/memory/process-embeddings", post(process_memory_embeddings))
         .route("/ws/events", get(ws_events))
         .with_state(state);
 
@@ -239,16 +343,26 @@ async fn trigger_agent_tick(
         .orchestrator
         .run_agent_tick(agent_id, tick_id.clone())
         .await
-        .map_err(|error| {
-            internal_error(
-                "tick_failed",
-                format!("failed to run agent tick: {error}"),
-            )
-        })?;
+        .map_err(|error| internal_error("tick_failed", format!("failed to run agent tick: {error}")))?;
 
     match outcome {
         AgentTickOrchestratorOutcome::Executed(result) => match result.status {
             AgentTickExecutionStatus::Applied => {
+                if let Err(error) = state
+                    .memory_service
+                    .append_memory(
+                        result.agent_id,
+                        format!(
+                            "{} (mood={}, valence={:.2}, arousal={:.2})",
+                            result.action_summary, result.mood_label, result.valence, result.arousal
+                        ),
+                        0.7,
+                    )
+                    .await
+                {
+                    tracing::error!(agent_id = %result.agent_id, error = %error, "failed to persist episodic memory from tick");
+                }
+
                 state.event_hub.publish(WsServerEvent::TickApplied {
                     agent_id: result.agent_id,
                     tick_id: result.tick_id.clone(),
@@ -279,14 +393,14 @@ async fn trigger_agent_tick(
                 }),
             )),
         },
-        AgentTickOrchestratorOutcome::SkippedBusy => Ok((
-            StatusCode::CONFLICT,
-            {
-                state.event_hub.publish(WsServerEvent::TickSkipped {
-                    agent_id,
-                    reason: "busy".to_owned(),
-                    tick_id: tick_id.clone(),
-                });
+        AgentTickOrchestratorOutcome::SkippedBusy => {
+            state.event_hub.publish(WsServerEvent::TickSkipped {
+                agent_id,
+                reason: "busy".to_owned(),
+                tick_id: tick_id.clone(),
+            });
+            Ok((
+                StatusCode::CONFLICT,
                 Json(TriggerTickResponse {
                     outcome: "skipped_busy",
                     agent_id,
@@ -295,9 +409,9 @@ async fn trigger_agent_tick(
                     mood_label: None,
                     valence: None,
                     arousal: None,
-                })
-            },
-        )),
+                }),
+            ))
+        }
         AgentTickOrchestratorOutcome::SkippedDuplicate => {
             state.event_hub.publish(WsServerEvent::TickSkipped {
                 agent_id,
@@ -324,12 +438,12 @@ async fn get_agent_state(
     State(state): State<ApiState>,
     Path(agent_id): Path<Uuid>,
 ) -> Result<Json<AgentStateResponse>, (StatusCode, Json<ApiErrorResponse>)> {
-    let Some(record) = state.repository.get_agent_state(agent_id).await.map_err(|error| {
-        internal_error(
-            "state_read_failed",
-            format!("failed to read agent state: {error}"),
-        )
-    })? else {
+    let Some(record) = state
+        .repository
+        .get_agent_state(agent_id)
+        .await
+        .map_err(|error| internal_error("state_read_failed", format!("failed to read agent state: {error}")))?
+    else {
         return Err((
             StatusCode::NOT_FOUND,
             Json(ApiErrorResponse {
@@ -357,19 +471,136 @@ async fn list_events(
         .repository
         .list_agent_events(query.agent_id, limit)
         .await
+        .map_err(|error| internal_error("events_read_failed", format!("failed to read events: {error}")))?;
+
+    let items = records.into_iter().map(map_event_record).collect();
+
+    Ok(Json(EventsResponse { items }))
+}
+
+async fn append_agent_memory(
+    State(state): State<ApiState>,
+    Path(agent_id): Path<Uuid>,
+    Json(payload): Json<AppendMemoryRequest>,
+) -> Result<(StatusCode, Json<AppendMemoryResponse>), (StatusCode, Json<ApiErrorResponse>)> {
+    if payload.content.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorResponse {
+                error: "invalid_content",
+                message: "memory content must not be empty".to_owned(),
+            }),
+        ));
+    }
+
+    let memory = state
+        .memory_service
+        .append_memory(agent_id, payload.content, payload.importance.unwrap_or(0.6))
+        .await
         .map_err(|error| {
             internal_error(
-                "events_read_failed",
-                format!("failed to read events: {error}"),
+                "memory_append_failed",
+                format!("failed to append memory: {error}"),
             )
         })?;
 
-    let items = records
-        .into_iter()
-        .map(map_event_record)
-        .collect();
+    Ok((
+        StatusCode::CREATED,
+        Json(AppendMemoryResponse {
+            memory_id: memory.id,
+            embedding_status: memory.embedding_status,
+        }),
+    ))
+}
 
-    Ok(Json(EventsResponse { items }))
+async fn recall_agent_memory(
+    State(state): State<ApiState>,
+    Path(agent_id): Path<Uuid>,
+    Query(query): Query<RecallQuery>,
+) -> Result<Json<RecallResponse>, (StatusCode, Json<ApiErrorResponse>)> {
+    if query.query.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorResponse {
+                error: "invalid_query",
+                message: "recall query must not be empty".to_owned(),
+            }),
+        ));
+    }
+
+    let top_k = query.top_k.unwrap_or(DEFAULT_RECALL_TOP_K).clamp(1, 50);
+    let recalled = state
+        .memory_service
+        .recall(agent_id, &query.query, top_k)
+        .await
+        .map_err(|error| {
+            internal_error(
+                "memory_recall_failed",
+                format!("failed to recall memory: {error}"),
+            )
+        })?;
+
+    let items = recalled.into_iter().map(map_recall_item).collect();
+    Ok(Json(RecallResponse { items }))
+}
+
+async fn summarize_agent_memory(
+    State(state): State<ApiState>,
+    Path(agent_id): Path<Uuid>,
+    payload: Option<Json<SummarizeMemoryRequest>>,
+) -> Result<Json<SummarizeMemoryResponse>, (StatusCode, Json<ApiErrorResponse>)> {
+    let body = payload.map(|Json(value)| value);
+    let max_active = body
+        .as_ref()
+        .and_then(|v| v.max_active)
+        .unwrap_or(state.memory_defaults.summary_max_active);
+    let batch_size = body
+        .as_ref()
+        .and_then(|v| v.batch_size)
+        .unwrap_or(state.memory_defaults.summary_batch_size);
+
+    let result = state
+        .memory_service
+        .summarize_overflow(agent_id, max_active, batch_size)
+        .await
+        .map_err(|error| {
+            internal_error(
+                "memory_summarize_failed",
+                format!("failed to summarize memory overflow: {error}"),
+            )
+        })?;
+
+    Ok(Json(SummarizeMemoryResponse {
+        created_summary: result.created_summary,
+        source_count: result.source_count,
+        summary_entry_id: result.summary_entry_id,
+    }))
+}
+
+async fn process_memory_embeddings(
+    State(state): State<ApiState>,
+    payload: Option<Json<ProcessEmbeddingsRequest>>,
+) -> Result<Json<ProcessEmbeddingsResponse>, (StatusCode, Json<ApiErrorResponse>)> {
+    let limit = payload
+        .map(|Json(value)| value.limit.unwrap_or(50))
+        .unwrap_or(50)
+        .clamp(1, 200);
+    let summary = state
+        .memory_service
+        .process_pending_embeddings(limit)
+        .await
+        .map_err(|error| {
+            internal_error(
+                "memory_embedding_failed",
+                format!("failed to process memory embeddings: {error}"),
+            )
+        })?;
+
+    Ok(Json(ProcessEmbeddingsResponse {
+        processed: summary.processed,
+        succeeded: summary.succeeded,
+        failed: summary.failed,
+    }))
 }
 
 async fn ws_events(
@@ -381,7 +612,10 @@ async fn ws_events(
 }
 
 async fn ws_events_session(mut socket: WebSocket, state: ApiState, query: WsEventsQuery) {
-    let snapshot_limit = query.snapshot_limit.unwrap_or(DEFAULT_WS_SNAPSHOT_LIMIT).clamp(1, 200);
+    let snapshot_limit = query
+        .snapshot_limit
+        .unwrap_or(DEFAULT_WS_SNAPSHOT_LIMIT)
+        .clamp(1, 200);
     let snapshot = state
         .repository
         .list_agent_events(query.agent_id, snapshot_limit)
@@ -459,6 +693,17 @@ fn map_event_record(record: AgentEventRecord) -> EventItemResponse {
         description: record.description,
         payload: record.payload_json.to_string(),
         occurred_at: record.occurred_at.to_rfc3339(),
+    }
+}
+
+fn map_recall_item(item: MemoryRecallItem) -> RecallItemResponse {
+    RecallItemResponse {
+        memory_id: item.memory.id,
+        score: item.score,
+        content: item.memory.content,
+        summary: item.memory.summary,
+        importance: item.memory.importance,
+        created_at: item.memory.created_at.to_rfc3339(),
     }
 }
 

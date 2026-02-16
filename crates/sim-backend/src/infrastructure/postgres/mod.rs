@@ -1,9 +1,11 @@
 mod agent_core_repository;
+mod memory_repository;
 
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 pub use agent_core_repository::PostgresAgentCoreRepository;
+pub use memory_repository::PostgresMemoryRepository;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
 use crate::app::config::DatabaseConfig;
