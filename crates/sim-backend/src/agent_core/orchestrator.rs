@@ -1,15 +1,19 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Result;
 use chrono::Utc;
-use serde_json::json;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::agent_core::{
     AgentCoreRepository, AgentStateRecord, AgentTickRunner, NewAgentEvent, TickRunOutcome,
 };
+use crate::llm::{LlmGenerateRequest, LlmPort};
 
 const DEFAULT_TICK_HISTORY_PER_AGENT: usize = 256;
+const LLM_SUMMARY_MAX_CHARS: usize = 512;
+const EVENT_DESCRIPTION_MAX_CHARS: usize = 180;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentTickExecutionStatus {
@@ -39,24 +43,40 @@ pub enum AgentTickOrchestratorOutcome {
 pub struct AgentTickOrchestrator {
     repository: Arc<dyn AgentCoreRepository>,
     tick_runner: AgentTickRunner,
+    llm: Option<Arc<dyn LlmPort>>,
 }
 
 impl AgentTickOrchestrator {
     pub fn new(repository: Arc<dyn AgentCoreRepository>) -> Self {
-        Self {
+        Self::with_dependencies(
             repository,
-            tick_runner: AgentTickRunner::new(DEFAULT_TICK_HISTORY_PER_AGENT),
-        }
+            AgentTickRunner::new(DEFAULT_TICK_HISTORY_PER_AGENT),
+            None,
+        )
     }
 
     pub fn with_tick_runner(
         repository: Arc<dyn AgentCoreRepository>,
         tick_runner: AgentTickRunner,
     ) -> Self {
+        Self::with_dependencies(repository, tick_runner, None)
+    }
+
+    pub fn with_dependencies(
+        repository: Arc<dyn AgentCoreRepository>,
+        tick_runner: AgentTickRunner,
+        llm: Option<Arc<dyn LlmPort>>,
+    ) -> Self {
         Self {
             repository,
             tick_runner,
+            llm,
         }
+    }
+
+    pub fn with_optional_llm(mut self, llm: Option<Arc<dyn LlmPort>>) -> Self {
+        self.llm = llm;
+        self
     }
 
     pub async fn run_agent_tick(
@@ -66,12 +86,13 @@ impl AgentTickOrchestrator {
     ) -> Result<AgentTickOrchestratorOutcome> {
         let tick_id = tick_id.unwrap_or_else(|| Uuid::new_v4().to_string());
         let repository = Arc::clone(&self.repository);
+        let llm = self.llm.clone();
         let tick_id_for_closure = tick_id.clone();
 
         let tick_outcome = self
             .tick_runner
             .run_tick(&agent_id.to_string(), &tick_id, move || async move {
-                execute_tick(repository.as_ref(), agent_id, &tick_id_for_closure).await
+                execute_tick(repository.as_ref(), llm, agent_id, &tick_id_for_closure).await
             })
             .await;
 
@@ -87,6 +108,7 @@ impl AgentTickOrchestrator {
 
 async fn execute_tick(
     repository: &dyn AgentCoreRepository,
+    llm: Option<Arc<dyn LlmPort>>,
     agent_id: Uuid,
     tick_id: &str,
 ) -> Result<AgentTickExecutionResult> {
@@ -124,17 +146,49 @@ async fn execute_tick(
         })
         .await?;
 
+    let (
+        action_summary,
+        llm_used,
+        llm_model,
+        llm_error,
+        llm_latency_ms,
+    ) = generate_action_summary(
+        llm.as_deref(),
+        &agent.name,
+        &agent.personality_json,
+        tick_id,
+        &next_mood,
+        next_valence,
+        next_arousal,
+    )
+    .await;
+
+    let description = format!(
+        "Agent `{}` executed tick `{}`: {}",
+        agent.name,
+        tick_id,
+        trim_text(&action_summary, EVENT_DESCRIPTION_MAX_CHARS)
+    );
+
     let event = repository
         .append_agent_event(&NewAgentEvent {
             agent_id: Some(agent_id),
             event_type: "agent.tick.executed".to_owned(),
-            description: format!("Agent `{}` executed tick `{}`", agent.name, tick_id),
+            description,
             payload_json: json!({
                 "agent_id": agent_id,
                 "tick_id": tick_id,
                 "mood_label": next_mood,
                 "valence": next_valence,
-                "arousal": next_arousal
+                "arousal": next_arousal,
+                "action_summary": action_summary,
+                "llm": {
+                    "configured": llm.is_some(),
+                    "used": llm_used,
+                    "model": llm_model,
+                    "error": llm_error,
+                    "latency_ms": llm_latency_ms,
+                }
             }),
         })
         .await?;
@@ -150,9 +204,88 @@ async fn execute_tick(
     })
 }
 
+async fn generate_action_summary(
+    llm: Option<&dyn LlmPort>,
+    agent_name: &str,
+    personality_json: &Value,
+    tick_id: &str,
+    mood_label: &str,
+    valence: f32,
+    arousal: f32,
+) -> (String, bool, Option<String>, Option<String>, Option<u128>) {
+    let fallback = fallback_summary(agent_name, mood_label);
+
+    let Some(llm) = llm else {
+        return (fallback, false, None, Some("llm_not_configured".to_owned()), None);
+    };
+
+    let request = LlmGenerateRequest {
+        system_prompt: Some(format!(
+            "You are a planning core for autonomous AI agent `{agent_name}`. Personality JSON: {personality_json}. Return only 1-2 concise sentences: reflection and immediate next action."
+        )),
+        user_prompt: format!(
+            "Tick: {tick_id}. Mood: {mood_label}. Valence: {valence:.2}. Arousal: {arousal:.2}. Generate reflection + next action."
+        ),
+        temperature: Some(0.5),
+        max_output_tokens: Some(96),
+    };
+
+    let started_at = Instant::now();
+    match llm.generate(request).await {
+        Ok(response) => {
+            let latency_ms = started_at.elapsed().as_millis();
+            tracing::info!(
+                agent_name,
+                tick_id,
+                model = %response.model,
+                latency_ms,
+                "llm summary generated for agent tick"
+            );
+            (
+                trim_text(&response.text, LLM_SUMMARY_MAX_CHARS),
+                true,
+                Some(response.model),
+                None,
+                Some(latency_ms),
+            )
+        }
+        Err(error) => {
+            let latency_ms = started_at.elapsed().as_millis();
+            tracing::warn!(
+                agent_name,
+                tick_id,
+                latency_ms,
+                error = %error,
+                "llm failed during agent tick, using deterministic fallback"
+            );
+            (
+                fallback,
+                false,
+                None,
+                Some(error.to_string()),
+                Some(latency_ms),
+            )
+        }
+    }
+}
+
+fn fallback_summary(agent_name: &str, mood_label: &str) -> String {
+    format!(
+        "{agent_name} stays {mood_label} and continues a routine social action in the environment."
+    )
+}
+
+fn trim_text(input: &str, max_chars: usize) -> String {
+    if input.chars().count() <= max_chars {
+        return input.trim().to_owned();
+    }
+    input.chars().take(max_chars).collect::<String>().trim().to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use anyhow::Result;
@@ -165,6 +298,7 @@ mod tests {
     use crate::agent_core::{
         AgentCoreRepository, AgentEventRecord, AgentRecord, AgentStateRecord, NewAgentEvent,
     };
+    use crate::llm::{LlmGenerateRequest, LlmGenerateResponse, LlmPort};
 
     use super::{
         AgentTickExecutionStatus, AgentTickOrchestrator, AgentTickOrchestratorOutcome,
@@ -175,6 +309,46 @@ mod tests {
         agents: Mutex<HashMap<Uuid, AgentRecord>>,
         states: Mutex<HashMap<Uuid, AgentStateRecord>>,
         events: Mutex<Vec<AgentEventRecord>>,
+    }
+
+    enum StubLlmMode {
+        Success(String),
+        Fail(String),
+    }
+
+    struct StubLlm {
+        mode: StubLlmMode,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl StubLlm {
+        fn success(summary: &str, calls: Arc<AtomicUsize>) -> Self {
+            Self {
+                mode: StubLlmMode::Success(summary.to_owned()),
+                calls,
+            }
+        }
+
+        fn fail(message: &str, calls: Arc<AtomicUsize>) -> Self {
+            Self {
+                mode: StubLlmMode::Fail(message.to_owned()),
+                calls,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmPort for StubLlm {
+        async fn generate(&self, _request: LlmGenerateRequest) -> Result<LlmGenerateResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match &self.mode {
+                StubLlmMode::Success(summary) => Ok(LlmGenerateResponse {
+                    text: summary.clone(),
+                    model: "stub-model".to_owned(),
+                }),
+                StubLlmMode::Fail(message) => Err(anyhow::anyhow!(message.clone())),
+            }
+        }
     }
 
     #[async_trait]
@@ -293,6 +467,66 @@ mod tests {
             second,
             AgentTickOrchestratorOutcome::SkippedDuplicate
         ));
+    }
+
+    #[tokio::test]
+    async fn uses_llm_summary_when_available() {
+        let repository = Arc::new(InMemoryAgentCoreRepository::default());
+        let agent_id = Uuid::new_v4();
+        seed_agent(repository.as_ref(), agent_id, "Lena").await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let llm: Arc<dyn LlmPort> =
+            Arc::new(StubLlm::success("Plans a cooperative conversation.", Arc::clone(&calls)));
+
+        let orchestrator = AgentTickOrchestrator::new(repository.clone()).with_optional_llm(Some(llm));
+        let outcome = orchestrator
+            .run_agent_tick(agent_id, Some("tick-llm-ok".to_owned()))
+            .await
+            .expect("tick should execute");
+
+        assert!(matches!(outcome, AgentTickOrchestratorOutcome::Executed(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let events = repository.events.lock().await;
+        let event = events.last().expect("event should exist");
+        assert_eq!(event.payload_json["llm"]["used"], true);
+        assert_eq!(event.payload_json["llm"]["model"], "stub-model");
+        assert_eq!(
+            event.payload_json["action_summary"],
+            "Plans a cooperative conversation."
+        );
+    }
+
+    #[tokio::test]
+    async fn falls_back_when_llm_fails() {
+        let repository = Arc::new(InMemoryAgentCoreRepository::default());
+        let agent_id = Uuid::new_v4();
+        seed_agent(repository.as_ref(), agent_id, "Mia").await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let llm: Arc<dyn LlmPort> =
+            Arc::new(StubLlm::fail("simulated llm outage", Arc::clone(&calls)));
+
+        let orchestrator = AgentTickOrchestrator::new(repository.clone()).with_optional_llm(Some(llm));
+        let outcome = orchestrator
+            .run_agent_tick(agent_id, Some("tick-llm-fail".to_owned()))
+            .await
+            .expect("tick should execute");
+
+        assert!(matches!(outcome, AgentTickOrchestratorOutcome::Executed(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let events = repository.events.lock().await;
+        let event = events.last().expect("event should exist");
+        assert_eq!(event.payload_json["llm"]["used"], false);
+        assert_eq!(event.payload_json["llm"]["configured"], true);
+        assert!(event.payload_json["llm"]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("simulated llm outage"));
+        assert!(event.payload_json["action_summary"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Mia"));
     }
 
     async fn seed_agent(

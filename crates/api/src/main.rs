@@ -18,7 +18,9 @@ use sim_backend::agent_core::{
 use sim_backend::app::config::ApiConfig;
 use sim_backend::app::observability::init_tracing;
 use sim_backend::app::runtime::ServiceRuntime;
+use sim_backend::infrastructure::gemini::GeminiClient;
 use sim_backend::infrastructure::postgres::{PostgresAgentCoreRepository, ensure_ready};
+use sim_backend::llm::LlmPort;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
@@ -148,9 +150,19 @@ async fn main() -> anyhow::Result<()> {
     let db_pool = ensure_ready(&config.database)
         .await
         .context("database startup check failed")?;
+    let gemini_client: Option<Arc<dyn LlmPort>> = match config.gemini.clone() {
+        Some(gemini_config) => {
+            tracing::info!(model = %gemini_config.model, "gemini client configured");
+            Some(Arc::new(GeminiClient::new(gemini_config)?) as Arc<dyn LlmPort>)
+        }
+        None => {
+            tracing::warn!("GEMINI_API_KEY is not set; api runs with deterministic tick fallback");
+            None
+        }
+    };
     let repository: Arc<dyn AgentCoreRepository> =
         Arc::new(PostgresAgentCoreRepository::new(db_pool));
-    let orchestrator = AgentTickOrchestrator::new(repository.clone());
+    let orchestrator = AgentTickOrchestrator::new(repository.clone()).with_optional_llm(gemini_client);
 
     let mut runtime = ServiceRuntime::new(
         config.common.service_name.clone(),

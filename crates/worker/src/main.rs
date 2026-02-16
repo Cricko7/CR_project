@@ -9,16 +9,17 @@ use sim_backend::app::observability::init_tracing;
 use sim_backend::app::runtime::ServiceRuntime;
 use sim_backend::infrastructure::gemini::GeminiClient;
 use sim_backend::infrastructure::postgres::{ensure_ready, PostgresAgentCoreRepository};
+use sim_backend::llm::LlmPort;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let config = WorkerConfig::from_env()?;
     init_tracing(&config.common.service_name, &config.common.log_level)?;
     let db_pool = ensure_ready(&config.database).await?;
-    let _gemini_client = match config.gemini.clone() {
+    let gemini_client: Option<Arc<dyn LlmPort>> = match config.gemini.clone() {
         Some(gemini_config) => {
             tracing::info!(model = %gemini_config.model, "gemini client configured");
-            Some(GeminiClient::new(gemini_config)?)
+            Some(Arc::new(GeminiClient::new(gemini_config)?) as Arc<dyn LlmPort>)
         }
         None => {
             tracing::warn!("GEMINI_API_KEY is not set; worker runs without llm integration");
@@ -27,7 +28,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let repository: Arc<dyn AgentCoreRepository> =
         Arc::new(PostgresAgentCoreRepository::new(db_pool));
-    let orchestrator = AgentTickOrchestrator::new(repository);
+    let orchestrator = AgentTickOrchestrator::new(repository).with_optional_llm(gemini_client);
 
     let mut runtime = ServiceRuntime::new(
         config.common.service_name.clone(),
