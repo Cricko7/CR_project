@@ -972,6 +972,14 @@ mod tests {
             Ok(agents.get(&agent_id).cloned())
         }
 
+        async fn list_agents(&self, limit: u32) -> Result<Vec<AgentRecord>> {
+            let agents = self.agents.lock().await;
+            let mut items: Vec<AgentRecord> = agents.values().cloned().collect();
+            items.sort_by_key(|record| record.created_at);
+            items.truncate(limit as usize);
+            Ok(items)
+        }
+
         async fn get_agent_state(&self, agent_id: Uuid) -> Result<Option<AgentStateRecord>> {
             let states = self.states.lock().await;
             Ok(states.get(&agent_id).cloned())

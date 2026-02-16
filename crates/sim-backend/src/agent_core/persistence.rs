@@ -109,6 +109,7 @@ pub enum TickLeaseAcquireResult {
 #[async_trait]
 pub trait AgentCoreRepository: Send + Sync {
     async fn get_agent(&self, agent_id: Uuid) -> Result<Option<AgentRecord>>;
+    async fn list_agents(&self, limit: u32) -> Result<Vec<AgentRecord>>;
     async fn get_agent_state(&self, agent_id: Uuid) -> Result<Option<AgentStateRecord>>;
     async fn upsert_agent_state(&self, state: &AgentStateRecord) -> Result<()>;
     async fn append_agent_event(&self, event: &NewAgentEvent) -> Result<AgentEventRecord>;

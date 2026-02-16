@@ -1,12 +1,14 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::Utc;
 use serde_json::json;
 use sim_backend::agent_core::{
-    AgentCoreRepository, AgentTickExecutionStatus, AgentTickOrchestrator,
+    AgentCoreRepository, AgentRecord, AgentTickExecutionStatus, AgentTickOrchestrator,
     AgentTickOrchestratorOutcome, DEFAULT_SIMULATION_TIME_SCALE, MAX_SIMULATION_TIME_SCALE,
-    MIN_SIMULATION_TIME_SCALE, MessageRecord, NewAgentEvent,
+    MIN_SIMULATION_TIME_SCALE, MessageRecord, NewAgentEvent, NewMessage,
 };
 use sim_backend::app::config::WorkerConfig;
 use sim_backend::app::observability::init_tracing;
@@ -28,6 +30,14 @@ use uuid::Uuid;
 const MESSAGE_CLAIM_TIMEOUT: Duration = Duration::from_secs(60);
 const MESSAGE_EVENT_DESCRIPTION_CHARS: usize = 200;
 const MIN_SIMULATION_SLEEP: Duration = Duration::from_millis(100);
+const CONVERSATION_MESSAGE_MAX_CHARS: usize = 280;
+const CONVERSATION_TOPICS: &[&str] = &[
+    "how to coordinate the next exploration step",
+    "sharing quick status updates",
+    "how to split responsibilities efficiently",
+    "who can help with the next risky move",
+    "a short plan for safer cooperation",
+];
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -296,6 +306,99 @@ async fn main() -> anyhow::Result<()> {
         Ok(())
     });
 
+    let conversation_repository = repository.clone();
+    let conversation_token = cancellation.clone();
+    let conversation_scan_interval = config.conversation_scan_interval;
+    let conversation_min_interval = config.conversation_min_interval;
+    let conversation_max_interval = config.conversation_max_interval;
+    let conversation_agent_limit = config.conversation_agent_limit;
+    runtime.spawn("conversation_seed_worker", async move {
+        let mut known_agent_ids = HashSet::<Uuid>::new();
+        let mut initialized = false;
+        let mut random_due_at = tokio::time::Instant::now();
+
+        loop {
+            tokio::select! {
+                _ = conversation_token.cancelled() => {
+                    tracing::info!("conversation seed worker received shutdown");
+                    break;
+                }
+                _ = tokio::time::sleep(conversation_scan_interval) => {
+                    let agents = match conversation_repository.list_agents(conversation_agent_limit).await {
+                        Ok(items) => items,
+                        Err(error) => {
+                            tracing::error!(error = %error, "conversation seed worker failed to list agents");
+                            continue;
+                        }
+                    };
+
+                    let current_ids: HashSet<Uuid> = agents.iter().map(|agent| agent.id).collect();
+                    if !initialized {
+                        known_agent_ids = current_ids;
+                        initialized = true;
+                        let next_delay = simulation_wait_duration(
+                            conversation_repository.as_ref(),
+                            random_duration_between(conversation_min_interval, conversation_max_interval),
+                            "conversation_seed_worker",
+                        )
+                        .await;
+                        random_due_at = tokio::time::Instant::now() + next_delay;
+                        continue;
+                    }
+
+                    let new_agents: Vec<AgentRecord> = agents
+                        .iter()
+                        .filter(|agent| !known_agent_ids.contains(&agent.id))
+                        .cloned()
+                        .collect();
+                    known_agent_ids = current_ids;
+
+                    for new_agent in &new_agents {
+                        match seed_onboarding_conversation(conversation_repository.as_ref(), new_agent, &agents).await {
+                            Ok(enqueued) if enqueued > 0 => {
+                                tracing::info!(
+                                    agent_id = %new_agent.id,
+                                    agent_name = %new_agent.name,
+                                    enqueued_messages = enqueued,
+                                    "seeded onboarding conversation for new agent"
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                tracing::error!(
+                                    agent_id = %new_agent.id,
+                                    error = %error,
+                                    "failed to seed onboarding conversation for new agent"
+                                );
+                            }
+                        }
+                    }
+
+                    if tokio::time::Instant::now() >= random_due_at {
+                        match seed_random_conversation(conversation_repository.as_ref(), &agents).await {
+                            Ok(enqueued) if enqueued > 0 => {
+                                tracing::debug!(enqueued_messages = enqueued, "seeded random conversation");
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                tracing::error!(error = %error, "failed to seed random conversation");
+                            }
+                        }
+
+                        let next_delay = simulation_wait_duration(
+                            conversation_repository.as_ref(),
+                            random_duration_between(conversation_min_interval, conversation_max_interval),
+                            "conversation_seed_worker",
+                        )
+                        .await;
+                        random_due_at = tokio::time::Instant::now() + next_delay;
+                    }
+                }
+            }
+        }
+        Ok(())
+    });
+
     runtime.run_until_shutdown().await
 }
 
@@ -342,6 +445,240 @@ fn sanitize_time_scale(raw: f32, worker_name: &'static str) -> f32 {
         );
     }
     clamped
+}
+
+async fn seed_onboarding_conversation(
+    repository: &dyn AgentCoreRepository,
+    new_agent: &AgentRecord,
+    all_agents: &[AgentRecord],
+) -> anyhow::Result<u32> {
+    let peers: Vec<AgentRecord> = all_agents
+        .iter()
+        .filter(|agent| agent.id != new_agent.id)
+        .cloned()
+        .collect();
+    if peers.is_empty() {
+        return Ok(0);
+    }
+
+    let topic = pick_random_topic();
+    if peers.len() == 1 {
+        let peer = &peers[0];
+        enqueue_agent_to_agent_message(
+            repository,
+            new_agent,
+            peer,
+            format!(
+                "Hi {}, I'm {}. Can we cooperate on {}?",
+                peer.name, new_agent.name, topic
+            ),
+        )
+        .await?;
+        return Ok(1);
+    }
+
+    let trio = choose_distinct_agents(&peers, 2);
+    if trio.len() < 2 {
+        return Ok(0);
+    }
+    let left = &trio[0];
+    let right = &trio[1];
+
+    enqueue_agent_to_agent_message(
+        repository,
+        new_agent,
+        left,
+        format!(
+            "Hi {}, I'm {}. Let's cooperate on {}.",
+            left.name, new_agent.name, topic
+        ),
+    )
+    .await?;
+    enqueue_agent_to_agent_message(
+        repository,
+        left,
+        right,
+        format!(
+            "{} just joined us. Can we coordinate this together?",
+            new_agent.name
+        ),
+    )
+    .await?;
+    enqueue_agent_to_agent_message(
+        repository,
+        right,
+        new_agent,
+        format!(
+            "Welcome {}, I'm in. Let's support each other on {}.",
+            new_agent.name, topic
+        ),
+    )
+    .await?;
+    Ok(3)
+}
+
+async fn seed_random_conversation(
+    repository: &dyn AgentCoreRepository,
+    all_agents: &[AgentRecord],
+) -> anyhow::Result<u32> {
+    if all_agents.len() < 2 {
+        return Ok(0);
+    }
+
+    let group_size = if all_agents.len() >= 3 && random_bool(55) {
+        3
+    } else {
+        2
+    };
+    let participants = choose_distinct_agents(all_agents, group_size);
+    if participants.len() < 2 {
+        return Ok(0);
+    }
+
+    let topic = pick_random_topic();
+    if participants.len() == 2 {
+        let first = &participants[0];
+        let second = &participants[1];
+        enqueue_agent_to_agent_message(
+            repository,
+            first,
+            second,
+            format!(
+                "{}, quick sync: can we cooperate on {}?",
+                second.name, topic
+            ),
+        )
+        .await?;
+
+        if random_bool(70) {
+            enqueue_agent_to_agent_message(
+                repository,
+                second,
+                first,
+                format!(
+                    "Yes {}, I can support that. Thanks for starting the chat.",
+                    first.name
+                ),
+            )
+            .await?;
+            return Ok(2);
+        }
+        return Ok(1);
+    }
+
+    let a = &participants[0];
+    let b = &participants[1];
+    let c = &participants[2];
+
+    enqueue_agent_to_agent_message(
+        repository,
+        a,
+        b,
+        format!(
+            "{}, let's coordinate {} and keep everyone aligned.",
+            b.name, topic
+        ),
+    )
+    .await?;
+    enqueue_agent_to_agent_message(
+        repository,
+        b,
+        c,
+        format!(
+            "{}, joining you both on {}. I can help with support.",
+            c.name, topic
+        ),
+    )
+    .await?;
+    enqueue_agent_to_agent_message(
+        repository,
+        c,
+        a,
+        format!(
+            "{}, agreed. Let's cooperate and share updates every step.",
+            a.name
+        ),
+    )
+    .await?;
+    Ok(3)
+}
+
+async fn enqueue_agent_to_agent_message(
+    repository: &dyn AgentCoreRepository,
+    sender: &AgentRecord,
+    receiver: &AgentRecord,
+    content: String,
+) -> anyhow::Result<()> {
+    if sender.id == receiver.id {
+        return Ok(());
+    }
+
+    repository
+        .enqueue_message(&NewMessage {
+            sender_type: "agent".to_owned(),
+            sender_id: Some(sender.id),
+            receiver_agent_id: receiver.id,
+            content: trim_text(&content, CONVERSATION_MESSAGE_MAX_CHARS),
+        })
+        .await?;
+    Ok(())
+}
+
+fn choose_distinct_agents(agents: &[AgentRecord], count: usize) -> Vec<AgentRecord> {
+    let mut pool: Vec<usize> = (0..agents.len()).collect();
+    let target = count.min(pool.len());
+    let mut selected = Vec::with_capacity(target);
+
+    while selected.len() < target && !pool.is_empty() {
+        let idx = random_index(pool.len());
+        let source_idx = pool.swap_remove(idx);
+        selected.push(agents[source_idx].clone());
+    }
+
+    selected
+}
+
+fn pick_random_topic() -> &'static str {
+    let idx = random_index(CONVERSATION_TOPICS.len());
+    CONVERSATION_TOPICS[idx]
+}
+
+fn random_duration_between(min: Duration, max: Duration) -> Duration {
+    let min_ms = u64::try_from(min.as_millis()).unwrap_or(u64::MAX / 2);
+    let max_ms = u64::try_from(max.as_millis()).unwrap_or(u64::MAX / 2);
+    if max_ms <= min_ms {
+        return Duration::from_millis(min_ms);
+    }
+
+    let span = max_ms.saturating_sub(min_ms);
+    let offset = if span == 0 {
+        0
+    } else {
+        random_u64() % span.saturating_add(1)
+    };
+    Duration::from_millis(min_ms.saturating_add(offset))
+}
+
+fn random_bool(chance_percent: u8) -> bool {
+    let threshold = chance_percent.min(100) as u64;
+    (random_u64() % 100) < threshold
+}
+
+fn random_index(len: usize) -> usize {
+    if len <= 1 {
+        return 0;
+    }
+    (random_u64() % len as u64) as usize
+}
+
+fn random_u64() -> u64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let uuid_bits = Uuid::new_v4().as_u128();
+    let mixed = now ^ uuid_bits ^ (uuid_bits.rotate_left(17));
+    (mixed as u64) ^ ((mixed >> 64) as u64)
 }
 
 async fn process_agent_tick(

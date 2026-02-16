@@ -23,7 +23,7 @@ Backend для симуляции мира автономных AI-агенто�
 | 1. Долговременная память (vector DB + summarization) | `FULLY IMPLEMENTED` | Реализованы `memory_entries`, embedding pipeline с retry+DLQ, Qdrant recall, архивирование старых воспоминаний, авто-суммаризация overflow, API для dead-letter requeue |
 | 2. Эмоциональный интеллект | `FULLY IMPLEMENTED` | Реализована динамика эмоций на каждом тике (summary + personality traits -> valence/arousal/mood), а также периодический mood decay к нейтрали в worker |
 | 3. Архитектура агента (рефлексия→цель→действие) | `FULLY IMPLEMENTED` | Tick pipeline декомпозирован на 4 стадии: reflection, goal selection, action planning, execution + side effects; результат и stage-trace пишутся в event payload |
-| 4. Мультиагентность (общение, отношения) | `FULLY IMPLEMENTED` | Реализованы API отправки/чтения сообщений, worker delivery lifecycle (`queued -> processing -> delivered/failed`) и автоматическое обновление `relationships` (affinity + history) при доставке |
+| 4. Мультиагентность (общение, отношения) | `FULLY IMPLEMENTED` | Реализованы API отправки/чтения сообщений, auto-seeding случайных разговоров (в т.ч. onboarding новых агентов), worker delivery lifecycle (`queued -> processing -> delivered/failed`) и автоматическое обновление `relationships` (affinity + history) при доставке |
 | 5. Real-time dashboard life feed | `FULLY IMPLEMENTED` | Реализован единый live feed через `/ws/events` для событий из API и worker (DB tail bridge), а также cursor polling через `/events?after_id=...` |
 | 6. Граф отношений | `FULLY IMPLEMENTED` | Есть graph snapshot API (`/relationships/graph`) и live stream (`/ws/relationships`); worker публикует `agent.relationship.updated` события |
 | 7. Inspector агента | `FULLY IMPLEMENTED` | Есть агрегирующий endpoint `/agents/{id}/inspector` (agent profile + state + recent events/messages/relationships/memories + optional recall) |
@@ -118,6 +118,8 @@ flowchart LR
 ### Communication
 - Текущее состояние:
   - есть enqueue/list API для межагентных сообщений;
+  - worker conversation seeder автоматически инициирует случайные разговоры между 2-3 агентами;
+  - при появлении нового агента worker автоматически стартует onboarding-диалог с другими агентами (включая 3-сторонний сценарий при наличии двух peers);
   - worker delivery loop обрабатывает очередь сообщений и пишет delivery events;
   - при доставке сообщения обновляется relationship score/history между агентами.
 
@@ -251,12 +253,15 @@ CR_project/
 6. При лаге клиента соединение закрывается с ошибкой stream lagged.
 
 ### 7.5 Message/relationship flow
-1. API `POST /agents/{receiver_id}/messages` добавляет запись в `messages` со статусом `queued`.
-2. Worker `message_delivery_worker` claim'ит queued batch (`FOR UPDATE SKIP LOCKED`) и переводит в `processing`.
-3. Для каждой записи:
+1. Источник сообщения:
+   - API `POST /agents/{receiver_id}/messages`, или
+   - auto-seeder воркера (random conversation/onboarding новых агентов).
+2. Сообщение добавляется в `messages` со статусом `queued`.
+3. Worker `message_delivery_worker` claim'ит queued batch (`FOR UPDATE SKIP LOCKED`) и переводит в `processing`.
+4. Для каждой записи:
    - пишется event `agent.message.received` для receiver;
    - обновляется `relationships` (upsert pair + affinity delta + history append).
-4. Delivery статус:
+5. Delivery статус:
    - success -> `delivered`;
    - failure -> `failed` + `delivery_error`.
 
@@ -948,6 +953,10 @@ Payload в point:
 | `WORKER_MOOD_DECAY_STEP` | `0.06` |
 | `WORKER_MESSAGE_INTERVAL_MS` | `1000` |
 | `WORKER_MESSAGE_BATCH_SIZE` | `32` |
+| `WORKER_CONVERSATION_SCAN_INTERVAL_MS` | `3000` |
+| `WORKER_CONVERSATION_MIN_INTERVAL_MS` | `12000` |
+| `WORKER_CONVERSATION_MAX_INTERVAL_MS` | `45000` |
+| `WORKER_CONVERSATION_AGENT_LIMIT` | `512` |
 
 ---
 
