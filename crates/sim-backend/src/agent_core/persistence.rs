@@ -6,6 +6,10 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use uuid::Uuid;
 
+pub const DEFAULT_SIMULATION_TIME_SCALE: f32 = 1.0;
+pub const MIN_SIMULATION_TIME_SCALE: f32 = 0.1;
+pub const MAX_SIMULATION_TIME_SCALE: f32 = 10.0;
+
 #[derive(Debug, Clone)]
 pub struct AgentRecord {
     pub id: Uuid,
@@ -90,6 +94,12 @@ pub struct NewIntervention {
     pub result_status: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct SimulationTimeScaleRecord {
+    pub time_scale: f32,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TickLeaseAcquireResult {
     Acquired,
@@ -160,4 +170,6 @@ pub trait AgentCoreRepository: Send + Sync {
         intervention: &NewIntervention,
     ) -> Result<InterventionRecord>;
     async fn list_interventions(&self, limit: u32) -> Result<Vec<InterventionRecord>>;
+    async fn get_time_scale(&self) -> Result<SimulationTimeScaleRecord>;
+    async fn set_time_scale(&self, time_scale: f32) -> Result<SimulationTimeScaleRecord>;
 }

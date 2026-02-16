@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -9,8 +9,9 @@ use sqlx::postgres::PgPool;
 use uuid::Uuid;
 
 use crate::agent_core::{
-    AgentCoreRepository, AgentEventRecord, AgentRecord, AgentStateRecord, InterventionRecord,
-    MessageRecord, NewAgentEvent, NewIntervention, NewMessage, RelationshipRecord,
+    AgentCoreRepository, AgentEventRecord, AgentRecord, AgentStateRecord,
+    DEFAULT_SIMULATION_TIME_SCALE, InterventionRecord, MessageRecord, NewAgentEvent,
+    NewIntervention, NewMessage, RelationshipRecord, SimulationTimeScaleRecord,
     TickLeaseAcquireResult,
 };
 
@@ -646,6 +647,58 @@ impl AgentCoreRepository for PostgresAgentCoreRepository {
 
         Ok(rows.into_iter().map(map_intervention_record).collect())
     }
+
+    async fn get_time_scale(&self) -> Result<SimulationTimeScaleRecord> {
+        sqlx::query(
+            r#"
+            INSERT INTO simulation_controls (id, time_scale)
+            VALUES (TRUE, $1)
+            ON CONFLICT (id) DO NOTHING
+            "#,
+        )
+        .bind(DEFAULT_SIMULATION_TIME_SCALE)
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize simulation controls singleton row")?;
+
+        let row = sqlx::query(
+            r#"
+            SELECT time_scale, updated_at
+            FROM simulation_controls
+            WHERE id = TRUE
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to read simulation time scale")?;
+
+        Ok(map_simulation_time_scale_record(row))
+    }
+
+    async fn set_time_scale(&self, time_scale: f32) -> Result<SimulationTimeScaleRecord> {
+        ensure!(
+            time_scale.is_finite() && time_scale > 0.0,
+            "time_scale must be a positive finite value"
+        );
+
+        let row = sqlx::query(
+            r#"
+            INSERT INTO simulation_controls (id, time_scale)
+            VALUES (TRUE, $1)
+            ON CONFLICT (id)
+            DO UPDATE SET
+                time_scale = EXCLUDED.time_scale,
+                updated_at = NOW()
+            RETURNING time_scale, updated_at
+            "#,
+        )
+        .bind(time_scale)
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to update simulation time scale")?;
+
+        Ok(map_simulation_time_scale_record(row))
+    }
 }
 
 fn map_agent_record(row: sqlx::postgres::PgRow) -> AgentRecord {
@@ -711,6 +764,13 @@ fn map_intervention_record(row: sqlx::postgres::PgRow) -> InterventionRecord {
         payload_json: row.get::<Value, _>("payload_json"),
         result_status: row.get::<String, _>("result_status"),
         created_at: row.get::<DateTime<Utc>, _>("created_at"),
+    }
+}
+
+fn map_simulation_time_scale_record(row: sqlx::postgres::PgRow) -> SimulationTimeScaleRecord {
+    SimulationTimeScaleRecord {
+        time_scale: row.get::<f32, _>("time_scale"),
+        updated_at: row.get::<DateTime<Utc>, _>("updated_at"),
     }
 }
 

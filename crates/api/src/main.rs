@@ -15,8 +15,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sim_backend::agent_core::{
     AgentCoreRepository, AgentEventRecord, AgentTickExecutionStatus, AgentTickOrchestrator,
-    AgentTickOrchestratorOutcome, InterventionRecord, MessageRecord, NewAgentEvent,
-    NewIntervention, NewMessage, RelationshipRecord,
+    AgentTickOrchestratorOutcome, InterventionRecord, MAX_SIMULATION_TIME_SCALE,
+    MIN_SIMULATION_TIME_SCALE, MessageRecord, NewAgentEvent, NewIntervention, NewMessage,
+    RelationshipRecord, SimulationTimeScaleRecord,
 };
 use sim_backend::app::config::ApiConfig;
 use sim_backend::app::observability::init_tracing;
@@ -266,6 +267,17 @@ struct RequeueDeadLetterResponse {
     requeued: bool,
 }
 
+#[derive(Serialize)]
+struct SimulationTimeScaleResponse {
+    time_scale: f32,
+    updated_at: String,
+}
+
+#[derive(Deserialize)]
+struct SetSimulationTimeScaleRequest {
+    time_scale: f32,
+}
+
 #[derive(Deserialize)]
 struct CreateInterventionRequest {
     admin_user_id: String,
@@ -295,6 +307,9 @@ enum InterventionActionRequest {
         description: String,
         payload_json: Option<Value>,
     },
+    SetTimeScale {
+        time_scale: f32,
+    },
 }
 
 impl InterventionActionRequest {
@@ -304,6 +319,7 @@ impl InterventionActionRequest {
             Self::AppendMemory { .. } => "append_memory",
             Self::SendMessage { .. } => "send_message",
             Self::AppendEvent { .. } => "append_event",
+            Self::SetTimeScale { .. } => "set_time_scale",
         }
     }
 
@@ -341,6 +357,9 @@ impl InterventionActionRequest {
                 "event_type": event_type,
                 "description": description,
                 "payload_json": payload_json,
+            }),
+            Self::SetTimeScale { time_scale } => json!({
+                "time_scale": time_scale,
             }),
         }
     }
@@ -396,6 +415,10 @@ enum InterventionEffectResponse {
     Event {
         event_id: i64,
         event_type: String,
+    },
+    TimeScale {
+        time_scale: f32,
+        updated_at: String,
     },
 }
 
@@ -624,6 +647,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/agents/{id}/state", get(get_agent_state))
         .route("/agents/{id}/inspector", get(get_agent_inspector))
         .route("/events", get(list_events))
+        .route(
+            "/simulation/time-scale",
+            get(get_simulation_time_scale).post(set_simulation_time_scale),
+        )
         .route(
             "/interventions",
             post(create_intervention).get(list_interventions),
@@ -1144,6 +1171,62 @@ async fn create_intervention(
             effect,
         }),
     ))
+}
+
+async fn get_simulation_time_scale(
+    State(state): State<ApiState>,
+) -> Result<Json<SimulationTimeScaleResponse>, (StatusCode, Json<ApiErrorResponse>)> {
+    let record = state.repository.get_time_scale().await.map_err(|error| {
+        internal_error(
+            "simulation_time_scale_read_failed",
+            format!("failed to read simulation time scale: {error}"),
+        )
+    })?;
+
+    Ok(Json(map_simulation_time_scale_record(record)))
+}
+
+async fn set_simulation_time_scale(
+    State(state): State<ApiState>,
+    Json(payload): Json<SetSimulationTimeScaleRequest>,
+) -> Result<Json<SimulationTimeScaleResponse>, (StatusCode, Json<ApiErrorResponse>)> {
+    let time_scale = validate_time_scale(payload.time_scale)?;
+    let previous_time_scale = state
+        .repository
+        .get_time_scale()
+        .await
+        .ok()
+        .map(|record| record.time_scale);
+
+    let record = state
+        .repository
+        .set_time_scale(time_scale)
+        .await
+        .map_err(|error| {
+            internal_error(
+                "simulation_time_scale_update_failed",
+                format!("failed to update simulation time scale: {error}"),
+            )
+        })?;
+
+    if let Err(error) = state
+        .repository
+        .append_agent_event(&NewAgentEvent {
+            agent_id: None,
+            event_type: "simulation.time_scale.updated".to_owned(),
+            description: format!("Simulation time scale updated to {:.2}", record.time_scale),
+            payload_json: json!({
+                "time_scale": record.time_scale,
+                "previous_time_scale": previous_time_scale,
+                "updated_at": record.updated_at.to_rfc3339(),
+            }),
+        })
+        .await
+    {
+        tracing::warn!(error = %error, "failed to append simulation time-scale update event");
+    }
+
+    Ok(Json(map_simulation_time_scale_record(record)))
 }
 
 async fn list_interventions(
@@ -1742,6 +1825,24 @@ async fn apply_intervention_action(
                 event_type: event.event_type,
             })
         }
+        InterventionActionRequest::SetTimeScale { time_scale } => {
+            let time_scale = validate_time_scale(*time_scale)?;
+            let updated = state
+                .repository
+                .set_time_scale(time_scale)
+                .await
+                .map_err(|error| {
+                    internal_error(
+                        "intervention_apply_failed",
+                        format!("failed to update simulation time scale: {error}"),
+                    )
+                })?;
+
+            Ok(InterventionEffectResponse::TimeScale {
+                time_scale: updated.time_scale,
+                updated_at: updated.updated_at.to_rfc3339(),
+            })
+        }
     }
 }
 
@@ -2263,6 +2364,15 @@ fn map_inspector_memory(memory: MemoryEntryRecord) -> InspectorMemoryItemRespons
     }
 }
 
+fn map_simulation_time_scale_record(
+    record: SimulationTimeScaleRecord,
+) -> SimulationTimeScaleResponse {
+    SimulationTimeScaleResponse {
+        time_scale: record.time_scale,
+        updated_at: record.updated_at.to_rfc3339(),
+    }
+}
+
 fn map_intervention_record(record: InterventionRecord) -> InterventionItemResponse {
     InterventionItemResponse {
         id: record.id,
@@ -2296,6 +2406,32 @@ fn map_relationship_record(record: RelationshipRecord) -> RelationshipItemRespon
         last_interaction_at: record.last_interaction_at.map(|value| value.to_rfc3339()),
         created_at: record.created_at.to_rfc3339(),
     }
+}
+
+fn validate_time_scale(time_scale: f32) -> Result<f32, (StatusCode, Json<ApiErrorResponse>)> {
+    if !time_scale.is_finite() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorResponse {
+                error: "invalid_time_scale",
+                message: "time_scale must be a finite number".to_owned(),
+            }),
+        ));
+    }
+
+    if !(MIN_SIMULATION_TIME_SCALE..=MAX_SIMULATION_TIME_SCALE).contains(&time_scale) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorResponse {
+                error: "invalid_time_scale",
+                message: format!(
+                    "time_scale must be in range [{MIN_SIMULATION_TIME_SCALE}, {MAX_SIMULATION_TIME_SCALE}]",
+                ),
+            }),
+        ));
+    }
+
+    Ok(time_scale)
 }
 
 fn internal_error(error: &'static str, message: String) -> (StatusCode, Json<ApiErrorResponse>) {

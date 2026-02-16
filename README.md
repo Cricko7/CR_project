@@ -27,7 +27,7 @@ Backend для симуляции мира автономных AI-агенто�
 | 5. Real-time dashboard life feed | `FULLY IMPLEMENTED` | Реализован единый live feed через `/ws/events` для событий из API и worker (DB tail bridge), а также cursor polling через `/events?after_id=...` |
 | 6. Граф отношений | `FULLY IMPLEMENTED` | Есть graph snapshot API (`/relationships/graph`) и live stream (`/ws/relationships`); worker публикует `agent.relationship.updated` события |
 | 7. Inspector агента | `FULLY IMPLEMENTED` | Есть агрегирующий endpoint `/agents/{id}/inspector` (agent profile + state + recent events/messages/relationships/memories + optional recall) |
-| 8. Панель вмешательства | `FULLY IMPLEMENTED` | Реализованы `POST/GET /interventions` с action-типами (`trigger_tick`, `append_memory`, `send_message`, `append_event`) и audit-log в таблице `interventions` |
+| 8. Панель вмешательства | `FULLY IMPLEMENTED` | Реализованы `POST/GET /interventions` (включая `append_event`, `send_message`, `set_time_scale`) и прямой runtime-control скорости через `GET/POST /simulation/time-scale` |
 | Доп. фича 1: настроение влияет на стиль речи | `FULLY IMPLEMENTED` | Введены формализованные mood-based speech style policies (tone/cadence/diction/punctuation), они инжектятся в LLM prompts, применяются в deterministic fallback и сохраняются в `events.payload_json.speech_style` |
 | Доп. фича 2: страница агента с историей отношений | `FULLY IMPLEMENTED` | Добавлен агрегированный relationship timeline API (`/agents/{id}/relationships/history`) и расширен inspector (`relationship_timeline`), что закрывает backend-контракт для страницы истории отношений |
 
@@ -130,7 +130,8 @@ flowchart LR
 ### Interventions
 - Текущее состояние:
   - есть полноценный API панели вмешательства: `POST /interventions`, `GET /interventions`;
-  - поддержаны action-типы: `trigger_tick`, `append_memory`, `send_message`, `append_event`;
+  - поддержаны action-типы: `trigger_tick`, `append_memory`, `send_message`, `append_event`, `set_time_scale`;
+  - есть отдельный endpoint управления скоростью симуляции: `GET/POST /simulation/time-scale`;
   - все запросы фиксируются в `interventions` с `result_status=applied|failed`.
 
 ### Observability
@@ -185,7 +186,8 @@ CR_project/
 │       │   ├── 0002_memory_long_term.sql
 │       │   ├── 0003_concurrency_failure_modes.sql
 │       │   ├── 0004_memory_embedding_retry_dlq.sql
-│       │   └── 0005_multyagent_communication.sql
+│       │   ├── 0005_multyagent_communication.sql
+│       │   └── 0006_simulation_time_scale.sql
 │       └── src/
 │           ├── app/                # config, runtime, observability
 │           ├── agent_core/         # orchestrator, persistence traits, tick runner
@@ -445,6 +447,7 @@ Request:
 - `append_memory`
 - `send_message`
 - `append_event`
+- `set_time_scale`
 
 Response (`200`):
 ```json
@@ -482,6 +485,39 @@ Response:
   ]
 }
 ```
+
+### 8.4.2 Simulation time scale
+
+#### `GET /simulation/time-scale`
+
+Response (`200`):
+```json
+{
+  "time_scale": 1.0,
+  "updated_at": "2026-02-16T12:00:00Z"
+}
+```
+
+#### `POST /simulation/time-scale`
+
+Request:
+```json
+{
+  "time_scale": 1.5
+}
+```
+
+Response (`200`):
+```json
+{
+  "time_scale": 1.5,
+  "updated_at": "2026-02-16T12:05:00Z"
+}
+```
+
+Validation:
+- `time_scale` должен быть числом в диапазоне `[0.1, 10.0]`.
+- Значение применяется без перезапуска и используется worker-циклами симуляции.
 
 ### 8.5 Agent message send
 
@@ -800,6 +836,7 @@ Examples:
 - `crates/sim-backend/migrations/0003_concurrency_failure_modes.sql`
 - `crates/sim-backend/migrations/0004_memory_embedding_retry_dlq.sql`
 - `crates/sim-backend/migrations/0005_multyagent_communication.sql`
+- `crates/sim-backend/migrations/0006_simulation_time_scale.sql`
 
 Основные таблицы:
 - `agents`: карточка агента, personality JSON.
@@ -809,6 +846,7 @@ Examples:
 - `relationships`: affinity/history между агентами, обновляется из message delivery.
 - `messages`: очередь межагентных сообщений + delivery status machine.
 - `interventions`: журнал админ-вмешательств (action payload + `result_status`).
+- `simulation_controls`: singleton runtime-настройка `time_scale` для скорости симуляции.
 - `outbox_events`: каркас event publication.
 
 Колонки long-term memory:
