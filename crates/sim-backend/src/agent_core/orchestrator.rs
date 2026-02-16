@@ -865,7 +865,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use anyhow::Result;
+    use anyhow::{Result, ensure};
     use async_trait::async_trait;
     use chrono::Utc;
     use serde_json::Value;
@@ -873,21 +873,38 @@ mod tests {
     use uuid::Uuid;
 
     use crate::agent_core::{
-        AgentCoreRepository, AgentEventRecord, AgentRecord, AgentStateRecord, InterventionRecord,
-        MessageRecord, NewAgentEvent, NewIntervention, NewMessage, RelationshipRecord,
+        AgentCoreRepository, AgentEventRecord, AgentRecord, AgentStateRecord,
+        DEFAULT_SIMULATION_TIME_SCALE, InterventionRecord, MessageRecord, NewAgentEvent,
+        NewIntervention, NewMessage, RelationshipRecord, SimulationTimeScaleRecord,
         TickLeaseAcquireResult,
     };
     use crate::llm::{LlmGenerateRequest, LlmGenerateResponse, LlmPort};
 
     use super::{AgentTickExecutionStatus, AgentTickOrchestrator, AgentTickOrchestratorOutcome};
 
-    #[derive(Default)]
     struct InMemoryAgentCoreRepository {
         agents: Mutex<HashMap<Uuid, AgentRecord>>,
         states: Mutex<HashMap<Uuid, AgentStateRecord>>,
         events: Mutex<Vec<AgentEventRecord>>,
         completed_ticks: Mutex<HashMap<Uuid, std::collections::HashSet<String>>>,
         active_leases: Mutex<HashMap<Uuid, String>>,
+        time_scale: Mutex<SimulationTimeScaleRecord>,
+    }
+
+    impl Default for InMemoryAgentCoreRepository {
+        fn default() -> Self {
+            Self {
+                agents: Mutex::new(HashMap::new()),
+                states: Mutex::new(HashMap::new()),
+                events: Mutex::new(Vec::new()),
+                completed_ticks: Mutex::new(HashMap::new()),
+                active_leases: Mutex::new(HashMap::new()),
+                time_scale: Mutex::new(SimulationTimeScaleRecord {
+                    time_scale: DEFAULT_SIMULATION_TIME_SCALE,
+                    updated_at: Utc::now(),
+                }),
+            }
+        }
     }
 
     enum StubLlmMode {
@@ -1163,6 +1180,21 @@ mod tests {
 
         async fn list_interventions(&self, _limit: u32) -> Result<Vec<InterventionRecord>> {
             Ok(Vec::new())
+        }
+
+        async fn get_time_scale(&self) -> Result<SimulationTimeScaleRecord> {
+            Ok(self.time_scale.lock().await.clone())
+        }
+
+        async fn set_time_scale(&self, time_scale: f32) -> Result<SimulationTimeScaleRecord> {
+            ensure!(
+                time_scale.is_finite() && time_scale > 0.0,
+                "time_scale must be a positive finite value"
+            );
+            let mut record = self.time_scale.lock().await;
+            record.time_scale = time_scale;
+            record.updated_at = Utc::now();
+            Ok(record.clone())
         }
     }
 

@@ -5,7 +5,8 @@ use chrono::Utc;
 use serde_json::json;
 use sim_backend::agent_core::{
     AgentCoreRepository, AgentTickExecutionStatus, AgentTickOrchestrator,
-    AgentTickOrchestratorOutcome, MessageRecord, NewAgentEvent,
+    AgentTickOrchestratorOutcome, DEFAULT_SIMULATION_TIME_SCALE, MAX_SIMULATION_TIME_SCALE,
+    MIN_SIMULATION_TIME_SCALE, MessageRecord, NewAgentEvent,
 };
 use sim_backend::app::config::WorkerConfig;
 use sim_backend::app::observability::init_tracing;
@@ -26,6 +27,7 @@ use uuid::Uuid;
 
 const MESSAGE_CLAIM_TIMEOUT: Duration = Duration::from_secs(60);
 const MESSAGE_EVENT_DESCRIPTION_CHARS: usize = 200;
+const MIN_SIMULATION_SLEEP: Duration = Duration::from_millis(100);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -76,6 +78,7 @@ async fn main() -> anyhow::Result<()> {
     let tick_concurrency = config.tick_concurrency as usize;
     let tick_orchestrator = orchestrator.clone();
     let tick_memory_service = Arc::clone(&memory_service);
+    let tick_scale_repository = repository.clone();
     let tick_token = cancellation.clone();
     runtime.spawn("agent_tick_worker", async move {
         if agent_ids.is_empty() {
@@ -84,15 +87,27 @@ async fn main() -> anyhow::Result<()> {
             );
         }
 
-        let mut interval = tokio::time::interval(tick_interval);
         let semaphore = Arc::new(Semaphore::new(tick_concurrency));
+        let mut first_tick = true;
         loop {
+            let wait_duration = if first_tick {
+                first_tick = false;
+                Duration::ZERO
+            } else {
+                simulation_wait_duration(
+                    tick_scale_repository.as_ref(),
+                    tick_interval,
+                    "agent_tick_worker",
+                )
+                .await
+            };
+
             tokio::select! {
                 _ = tick_token.cancelled() => {
                     tracing::info!("agent tick worker received shutdown");
                     break;
                 }
-                _ = interval.tick() => {
+                _ = tokio::time::sleep(wait_duration) => {
                     let mut in_flight = JoinSet::new();
                     for agent_id in agent_ids.iter().copied() {
                         let permit_pool = Arc::clone(&semaphore);
@@ -123,14 +138,26 @@ async fn main() -> anyhow::Result<()> {
     let mood_decay_repository = postgres_agent_repository.clone();
     let mood_token = cancellation.clone();
     runtime.spawn("mood_decay_worker", async move {
-        let mut interval = tokio::time::interval(mood_decay_interval);
+        let mut first_tick = true;
         loop {
+            let wait_duration = if first_tick {
+                first_tick = false;
+                Duration::ZERO
+            } else {
+                simulation_wait_duration(
+                    mood_decay_repository.as_ref(),
+                    mood_decay_interval,
+                    "mood_decay_worker",
+                )
+                .await
+            };
+
             tokio::select! {
                 _ = mood_token.cancelled() => {
                     tracing::info!("mood decay worker received shutdown");
                     break;
                 }
-                _ = interval.tick() => {
+                _ = tokio::time::sleep(wait_duration) => {
                     match mood_decay_repository.apply_global_mood_decay(mood_decay_step).await {
                         Ok(updated) => {
                             tracing::debug!(
@@ -230,14 +257,26 @@ async fn main() -> anyhow::Result<()> {
     let message_repository = repository.clone();
     let message_token = cancellation.clone();
     runtime.spawn("message_delivery_worker", async move {
-        let mut interval = tokio::time::interval(message_interval);
+        let mut first_tick = true;
         loop {
+            let wait_duration = if first_tick {
+                first_tick = false;
+                Duration::ZERO
+            } else {
+                simulation_wait_duration(
+                    message_repository.as_ref(),
+                    message_interval,
+                    "message_delivery_worker",
+                )
+                .await
+            };
+
             tokio::select! {
                 _ = message_token.cancelled() => {
                     tracing::info!("message delivery worker received shutdown");
                     break;
                 }
-                _ = interval.tick() => {
+                _ = tokio::time::sleep(wait_duration) => {
                     match message_repository
                         .claim_queued_messages(message_batch_size, MESSAGE_CLAIM_TIMEOUT)
                         .await
@@ -258,6 +297,51 @@ async fn main() -> anyhow::Result<()> {
     });
 
     runtime.run_until_shutdown().await
+}
+
+async fn simulation_wait_duration(
+    repository: &dyn AgentCoreRepository,
+    base_interval: Duration,
+    worker_name: &'static str,
+) -> Duration {
+    let time_scale = match repository.get_time_scale().await {
+        Ok(record) => sanitize_time_scale(record.time_scale, worker_name),
+        Err(error) => {
+            tracing::warn!(
+                worker = worker_name,
+                error = %error,
+                fallback_time_scale = DEFAULT_SIMULATION_TIME_SCALE,
+                "failed to read simulation time scale; using default"
+            );
+            DEFAULT_SIMULATION_TIME_SCALE
+        }
+    };
+
+    let scaled = base_interval.as_secs_f64() / f64::from(time_scale);
+    Duration::from_secs_f64(scaled.max(MIN_SIMULATION_SLEEP.as_secs_f64()))
+}
+
+fn sanitize_time_scale(raw: f32, worker_name: &'static str) -> f32 {
+    if !raw.is_finite() {
+        tracing::warn!(
+            worker = worker_name,
+            received_time_scale = %raw,
+            fallback_time_scale = DEFAULT_SIMULATION_TIME_SCALE,
+            "received non-finite simulation time scale; using default"
+        );
+        return DEFAULT_SIMULATION_TIME_SCALE;
+    }
+
+    let clamped = raw.clamp(MIN_SIMULATION_TIME_SCALE, MAX_SIMULATION_TIME_SCALE);
+    if (clamped - raw).abs() > f32::EPSILON {
+        tracing::warn!(
+            worker = worker_name,
+            received_time_scale = %raw,
+            applied_time_scale = %clamped,
+            "simulation time scale was out of range and has been clamped"
+        );
+    }
+    clamped
 }
 
 async fn process_agent_tick(
