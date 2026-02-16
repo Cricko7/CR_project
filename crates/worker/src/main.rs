@@ -7,13 +7,24 @@ use sim_backend::agent_core::{
 use sim_backend::app::config::WorkerConfig;
 use sim_backend::app::observability::init_tracing;
 use sim_backend::app::runtime::ServiceRuntime;
-use sim_backend::infrastructure::postgres::{PostgresAgentCoreRepository, ensure_ready};
+use sim_backend::infrastructure::gemini::GeminiClient;
+use sim_backend::infrastructure::postgres::{ensure_ready, PostgresAgentCoreRepository};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let config = WorkerConfig::from_env()?;
     init_tracing(&config.common.service_name, &config.common.log_level)?;
     let db_pool = ensure_ready(&config.database).await?;
+    let _gemini_client = match config.gemini.clone() {
+        Some(gemini_config) => {
+            tracing::info!(model = %gemini_config.model, "gemini client configured");
+            Some(GeminiClient::new(gemini_config)?)
+        }
+        None => {
+            tracing::warn!("GEMINI_API_KEY is not set; worker runs without llm integration");
+            None
+        }
+    };
     let repository: Arc<dyn AgentCoreRepository> =
         Arc::new(PostgresAgentCoreRepository::new(db_pool));
     let orchestrator = AgentTickOrchestrator::new(repository);

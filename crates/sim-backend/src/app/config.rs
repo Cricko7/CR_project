@@ -19,6 +19,11 @@ const DEFAULT_DATABASE_ACQUIRE_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_DATABASE_IDLE_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_DATABASE_MAX_LIFETIME_MS: u64 = 300_000;
 const DEFAULT_DATABASE_RUN_MIGRATIONS: bool = false;
+const DEFAULT_GEMINI_MODEL: &str = "gemini-2.0-flash";
+const DEFAULT_GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com";
+const DEFAULT_GEMINI_TIMEOUT_MS: u64 = 15_000;
+const DEFAULT_GEMINI_MAX_RETRIES: u32 = 2;
+const DEFAULT_GEMINI_RETRY_BACKOFF_MS: u64 = 300;
 
 #[derive(Debug, Clone)]
 pub struct CommonConfig {
@@ -39,9 +44,20 @@ pub struct DatabaseConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct GeminiConfig {
+    pub api_key: String,
+    pub model: String,
+    pub base_url: String,
+    pub timeout: Duration,
+    pub max_retries: u32,
+    pub retry_backoff: Duration,
+}
+
+#[derive(Debug, Clone)]
 pub struct ApiConfig {
     pub common: CommonConfig,
     pub database: DatabaseConfig,
+    pub gemini: Option<GeminiConfig>,
     pub host: IpAddr,
     pub port: u16,
 }
@@ -50,6 +66,7 @@ impl ApiConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
         let common = load_common_config(DEFAULT_SERVICE_NAME)?;
         let database = load_database_config()?;
+        let gemini = load_gemini_config()?;
         let host_raw: String = parse_env("API_HOST", DEFAULT_HOST.to_owned())?;
         let host = host_raw
             .parse::<IpAddr>()
@@ -62,6 +79,7 @@ impl ApiConfig {
         Ok(Self {
             common,
             database,
+            gemini,
             host,
             port,
         })
@@ -76,6 +94,7 @@ impl ApiConfig {
 pub struct WorkerConfig {
     pub common: CommonConfig,
     pub database: DatabaseConfig,
+    pub gemini: Option<GeminiConfig>,
     pub agent_ids: Vec<Uuid>,
     pub tick_interval: Duration,
     pub mood_decay_interval: Duration,
@@ -85,6 +104,7 @@ impl WorkerConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
         let common = load_common_config("sim-worker")?;
         let database = load_database_config()?;
+        let gemini = load_gemini_config()?;
         let agent_ids = parse_uuid_list_env("WORKER_AGENT_IDS")?;
         let tick_interval_ms: u64 =
             parse_env("WORKER_TICK_INTERVAL_MS", DEFAULT_WORKER_TICK_INTERVAL_MS)?;
@@ -107,6 +127,7 @@ impl WorkerConfig {
         Ok(Self {
             common,
             database,
+            gemini,
             agent_ids,
             tick_interval: Duration::from_millis(tick_interval_ms),
             mood_decay_interval: Duration::from_millis(mood_decay_interval_ms),
@@ -221,6 +242,47 @@ fn validate_log_level(raw: &str) -> Result<(), ConfigError> {
             "must be one of trace|debug|info|warn|error",
         ))
     }
+}
+
+fn load_gemini_config() -> Result<Option<GeminiConfig>, ConfigError> {
+    let api_key = env::var("GEMINI_API_KEY")
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_default();
+    if api_key.is_empty() {
+        return Ok(None);
+    }
+
+    let model: String = parse_env("GEMINI_MODEL", DEFAULT_GEMINI_MODEL.to_owned())?;
+    let base_url: String = parse_env("GEMINI_BASE_URL", DEFAULT_GEMINI_BASE_URL.to_owned())?;
+    let timeout_ms: u64 = parse_env("GEMINI_TIMEOUT_MS", DEFAULT_GEMINI_TIMEOUT_MS)?;
+    let max_retries: u32 = parse_env("GEMINI_MAX_RETRIES", DEFAULT_GEMINI_MAX_RETRIES)?;
+    let retry_backoff_ms: u64 =
+        parse_env("GEMINI_RETRY_BACKOFF_MS", DEFAULT_GEMINI_RETRY_BACKOFF_MS)?;
+
+    if model.trim().is_empty() {
+        return Err(ConfigError::invalid("GEMINI_MODEL", "must not be empty"));
+    }
+    if base_url.trim().is_empty() {
+        return Err(ConfigError::invalid("GEMINI_BASE_URL", "must not be empty"));
+    }
+    if timeout_ms == 0 {
+        return Err(ConfigError::invalid("GEMINI_TIMEOUT_MS", "must be greater than 0"));
+    }
+    if retry_backoff_ms == 0 {
+        return Err(ConfigError::invalid(
+            "GEMINI_RETRY_BACKOFF_MS",
+            "must be greater than 0",
+        ));
+    }
+
+    Ok(Some(GeminiConfig {
+        api_key,
+        model,
+        base_url,
+        timeout: Duration::from_millis(timeout_ms),
+        max_retries,
+        retry_backoff: Duration::from_millis(retry_backoff_ms),
+    }))
 }
 
 fn parse_uuid_list_env(key: &'static str) -> Result<Vec<Uuid>, ConfigError> {
