@@ -10,3 +10,4 @@ serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 sim-backend = { path = "../sim-backend" }
+uuid.workspace = true

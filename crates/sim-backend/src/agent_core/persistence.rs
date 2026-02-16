@@ -46,4 +46,9 @@ pub trait AgentCoreRepository: Send + Sync {
     async fn get_agent_state(&self, agent_id: Uuid) -> Result<Option<AgentStateRecord>>;
     async fn upsert_agent_state(&self, state: &AgentStateRecord) -> Result<()>;
     async fn append_agent_event(&self, event: &NewAgentEvent) -> Result<AgentEventRecord>;
+    async fn list_agent_events(
+        &self,
+        agent_id: Option<Uuid>,
+        limit: u32,
+    ) -> Result<Vec<AgentEventRecord>>;
 }

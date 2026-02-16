@@ -209,6 +209,25 @@ mod tests {
             events.push(record.clone());
             Ok(record)
         }
+
+        async fn list_agent_events(
+            &self,
+            agent_id: Option<Uuid>,
+            limit: u32,
+        ) -> Result<Vec<AgentEventRecord>> {
+            let events = self.events.lock().await;
+            let mut filtered: Vec<AgentEventRecord> = events
+                .iter()
+                .filter(|record| match agent_id {
+                    Some(id) => record.agent_id == Some(id),
+                    None => true,
+                })
+                .cloned()
+                .collect();
+            filtered.reverse();
+            filtered.truncate(limit as usize);
+            Ok(filtered)
+        }
     }
 
     #[tokio::test]

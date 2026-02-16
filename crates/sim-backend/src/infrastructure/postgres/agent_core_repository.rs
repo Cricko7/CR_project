@@ -97,6 +97,44 @@ impl AgentCoreRepository for PostgresAgentCoreRepository {
 
         Ok(map_agent_event_record(row))
     }
+
+    async fn list_agent_events(
+        &self,
+        agent_id: Option<Uuid>,
+        limit: u32,
+    ) -> Result<Vec<AgentEventRecord>> {
+        let rows = if let Some(agent_id) = agent_id {
+            sqlx::query(
+                r#"
+                SELECT id, agent_id, event_type, description, payload_json, occurred_at
+                FROM events
+                WHERE agent_id = $1
+                ORDER BY occurred_at DESC
+                LIMIT $2
+                "#,
+            )
+            .bind(agent_id)
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await
+            .context("failed to list events by agent id")?
+        } else {
+            sqlx::query(
+                r#"
+                SELECT id, agent_id, event_type, description, payload_json, occurred_at
+                FROM events
+                ORDER BY occurred_at DESC
+                LIMIT $1
+                "#,
+            )
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await
+            .context("failed to list events")?
+        };
+
+        Ok(rows.into_iter().map(map_agent_event_record).collect())
+    }
 }
 
 fn map_agent_record(row: sqlx::postgres::PgRow) -> AgentRecord {
