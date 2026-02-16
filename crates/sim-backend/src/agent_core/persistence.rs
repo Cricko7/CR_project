@@ -89,6 +89,13 @@ pub trait AgentCoreRepository: Send + Sync {
         agent_id: Option<Uuid>,
         limit: u32,
     ) -> Result<Vec<AgentEventRecord>>;
+    async fn list_agent_events_after_id(
+        &self,
+        agent_id: Option<Uuid>,
+        after_id: i64,
+        limit: u32,
+    ) -> Result<Vec<AgentEventRecord>>;
+    async fn latest_event_id(&self, agent_id: Option<Uuid>) -> Result<Option<i64>>;
     async fn has_completed_tick(&self, agent_id: Uuid, tick_id: &str) -> Result<bool>;
     async fn try_acquire_tick_lease(
         &self,

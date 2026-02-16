@@ -10,6 +10,8 @@ const DEFAULT_SERVICE_NAME: &str = "sim-backend";
 const DEFAULT_LOG_LEVEL: &str = "info";
 const DEFAULT_HOST: &str = "0.0.0.0";
 const DEFAULT_API_PORT: u16 = 8080;
+const DEFAULT_API_EVENT_BRIDGE_INTERVAL_MS: u64 = 500;
+const DEFAULT_API_EVENT_BRIDGE_BATCH_SIZE: u32 = 128;
 const DEFAULT_SHUTDOWN_TIMEOUT_MS: u64 = 15_000;
 const DEFAULT_WORKER_TICK_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_WORKER_TICK_CONCURRENCY: u32 = 8;
@@ -95,6 +97,8 @@ pub struct ApiConfig {
     pub gemini: Option<GeminiConfig>,
     pub host: IpAddr,
     pub port: u16,
+    pub event_bridge_interval: Duration,
+    pub event_bridge_batch_size: u32,
 }
 
 impl ApiConfig {
@@ -109,8 +113,28 @@ impl ApiConfig {
             .parse::<IpAddr>()
             .map_err(|error| ConfigError::parse("API_HOST", error.to_string()))?;
         let port = parse_env("API_PORT", DEFAULT_API_PORT)?;
+        let event_bridge_interval_ms: u64 = parse_env(
+            "API_EVENT_BRIDGE_INTERVAL_MS",
+            DEFAULT_API_EVENT_BRIDGE_INTERVAL_MS,
+        )?;
+        let event_bridge_batch_size: u32 = parse_env(
+            "API_EVENT_BRIDGE_BATCH_SIZE",
+            DEFAULT_API_EVENT_BRIDGE_BATCH_SIZE,
+        )?;
         if port == 0 {
             return Err(ConfigError::invalid("API_PORT", "must be greater than 0"));
+        }
+        if event_bridge_interval_ms == 0 {
+            return Err(ConfigError::invalid(
+                "API_EVENT_BRIDGE_INTERVAL_MS",
+                "must be greater than 0",
+            ));
+        }
+        if event_bridge_batch_size == 0 {
+            return Err(ConfigError::invalid(
+                "API_EVENT_BRIDGE_BATCH_SIZE",
+                "must be greater than 0",
+            ));
         }
 
         Ok(Self {
@@ -121,6 +145,8 @@ impl ApiConfig {
             gemini,
             host,
             port,
+            event_bridge_interval: Duration::from_millis(event_bridge_interval_ms),
+            event_bridge_batch_size,
         })
     }
 

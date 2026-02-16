@@ -799,6 +799,39 @@ mod tests {
             Ok(filtered)
         }
 
+        async fn list_agent_events_after_id(
+            &self,
+            agent_id: Option<Uuid>,
+            after_id: i64,
+            limit: u32,
+        ) -> Result<Vec<AgentEventRecord>> {
+            let events = self.events.lock().await;
+            let mut filtered: Vec<AgentEventRecord> = events
+                .iter()
+                .filter(|record| match agent_id {
+                    Some(id) => record.agent_id == Some(id),
+                    None => true,
+                })
+                .filter(|record| record.id > after_id)
+                .cloned()
+                .collect();
+            filtered.sort_by_key(|record| record.id);
+            filtered.truncate(limit as usize);
+            Ok(filtered)
+        }
+
+        async fn latest_event_id(&self, agent_id: Option<Uuid>) -> Result<Option<i64>> {
+            let events = self.events.lock().await;
+            Ok(events
+                .iter()
+                .filter(|record| match agent_id {
+                    Some(id) => record.agent_id == Some(id),
+                    None => true,
+                })
+                .map(|record| record.id)
+                .max())
+        }
+
         async fn has_completed_tick(&self, agent_id: Uuid, tick_id: &str) -> Result<bool> {
             let completed = self.completed_ticks.lock().await;
             Ok(completed

@@ -78,11 +78,14 @@ struct TriggerTickResponse {
 struct EventsQuery {
     agent_id: Option<Uuid>,
     limit: Option<u32>,
+    after_id: Option<i64>,
 }
 
 #[derive(Serialize)]
 struct EventsResponse {
     items: Vec<EventItemResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_after_id: Option<i64>,
 }
 
 #[derive(Serialize, Clone)]
@@ -263,18 +266,13 @@ enum WsServerEvent {
     Snapshot {
         items: Vec<EventItemResponse>,
     },
-    TickApplied {
-        agent_id: Uuid,
-        tick_id: String,
-        event_id: Option<i64>,
-        mood_label: String,
-        valence: f32,
-        arousal: f32,
-    },
     TickSkipped {
         agent_id: Uuid,
         reason: String,
         tick_id: Option<String>,
+    },
+    EventAppended {
+        item: EventItemResponse,
     },
     Error {
         message: String,
@@ -347,17 +345,18 @@ async fn main() -> anyhow::Result<()> {
         config.common.shutdown_timeout,
     );
     let cancellation = runtime.cancellation_token();
+    let event_hub = ApiEventHub::new(EVENT_HUB_CAPACITY);
 
     let state = ApiState {
         service_name: config.common.service_name.clone(),
-        repository,
+        repository: repository.clone(),
         orchestrator,
         memory_service,
         memory_defaults: MemoryRuntimeDefaults {
             summary_max_active: config.memory.max_active_per_agent,
             summary_batch_size: config.memory.summary_batch_size,
         },
-        event_hub: ApiEventHub::new(EVENT_HUB_CAPACITY),
+        event_hub: event_hub.clone(),
     };
     let app = Router::new()
         .route("/health", get(health))
@@ -422,6 +421,70 @@ async fn main() -> anyhow::Result<()> {
         Ok(())
     });
 
+    let event_bridge_repository = repository.clone();
+    let event_bridge_hub = event_hub.clone();
+    let event_bridge_interval = config.event_bridge_interval;
+    let event_bridge_batch_size = config.event_bridge_batch_size;
+    let event_bridge_token = cancellation.clone();
+    runtime.spawn("event_bridge_worker", async move {
+        let mut cursor: Option<i64> = None;
+        let mut interval = tokio::time::interval(event_bridge_interval);
+        loop {
+            tokio::select! {
+                _ = event_bridge_token.cancelled() => {
+                    tracing::info!("event bridge worker received shutdown");
+                    break;
+                }
+                _ = interval.tick() => {
+                    if cursor.is_none() {
+                        match event_bridge_repository.latest_event_id(None).await {
+                            Ok(latest) => {
+                                cursor = Some(latest.unwrap_or(0));
+                            }
+                            Err(error) => {
+                                tracing::error!(error = %error, "event bridge failed to initialize cursor");
+                            }
+                        }
+                        continue;
+                    }
+
+                    let mut tail_cursor = cursor.unwrap_or(0);
+                    loop {
+                        let records = match event_bridge_repository
+                            .list_agent_events_after_id(None, tail_cursor, event_bridge_batch_size)
+                            .await
+                        {
+                            Ok(records) => records,
+                            Err(error) => {
+                                tracing::error!(error = %error, after_id = tail_cursor, "event bridge failed to read new events");
+                                break;
+                            }
+                        };
+
+                        if records.is_empty() {
+                            break;
+                        }
+
+                        let batch_len = records.len();
+                        for record in records {
+                            tail_cursor = tail_cursor.max(record.id);
+                            event_bridge_hub.publish(WsServerEvent::EventAppended {
+                                item: map_event_record(record),
+                            });
+                        }
+
+                        if batch_len < event_bridge_batch_size as usize {
+                            break;
+                        }
+                    }
+
+                    cursor = Some(tail_cursor);
+                }
+            }
+        }
+        Ok(())
+    });
+
     runtime.run_until_shutdown().await
 }
 
@@ -466,15 +529,6 @@ async fn trigger_agent_tick(
                 {
                     tracing::error!(agent_id = %result.agent_id, error = %error, "failed to persist episodic memory from tick");
                 }
-
-                state.event_hub.publish(WsServerEvent::TickApplied {
-                    agent_id: result.agent_id,
-                    tick_id: result.tick_id.clone(),
-                    event_id: result.event_id,
-                    mood_label: result.mood_label.clone(),
-                    valence: result.valence,
-                    arousal: result.arousal,
-                });
 
                 Ok((
                     StatusCode::OK,
@@ -576,20 +630,48 @@ async fn list_events(
     Query(query): Query<EventsQuery>,
 ) -> Result<Json<EventsResponse>, (StatusCode, Json<ApiErrorResponse>)> {
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
-    let records = state
-        .repository
-        .list_agent_events(query.agent_id, limit)
-        .await
-        .map_err(|error| {
-            internal_error(
-                "events_read_failed",
-                format!("failed to read events: {error}"),
-            )
-        })?;
+    let records = if let Some(after_id) = query.after_id {
+        state
+            .repository
+            .list_agent_events_after_id(query.agent_id, after_id, limit)
+            .await
+            .map_err(|error| {
+                internal_error(
+                    "events_read_failed",
+                    format!("failed to read events after id: {error}"),
+                )
+            })?
+    } else {
+        state
+            .repository
+            .list_agent_events(query.agent_id, limit)
+            .await
+            .map_err(|error| {
+                internal_error(
+                    "events_read_failed",
+                    format!("failed to read events: {error}"),
+                )
+            })?
+    };
+
+    let next_after_id = if let Some(after_id) = query.after_id {
+        Some(
+            records
+                .iter()
+                .map(|record| record.id)
+                .max()
+                .unwrap_or(after_id),
+        )
+    } else {
+        None
+    };
 
     let items = records.into_iter().map(map_event_record).collect();
 
-    Ok(Json(EventsResponse { items }))
+    Ok(Json(EventsResponse {
+        items,
+        next_after_id,
+    }))
 }
 
 async fn append_agent_memory(
@@ -937,6 +1019,9 @@ async fn ws_events_session(mut socket: WebSocket, state: ApiState, query: WsEven
     loop {
         match receiver.recv().await {
             Ok(event) => {
+                if !ws_event_matches_agent(&event, query.agent_id) {
+                    continue;
+                }
                 if !send_ws_event(&mut socket, &event).await {
                     break;
                 }
@@ -977,6 +1062,21 @@ async fn send_ws_event(socket: &mut WebSocket, event: &WsServerEvent) -> bool {
             tracing::debug!(error = %error, "websocket send failed");
             false
         }
+    }
+}
+
+fn ws_event_matches_agent(event: &WsServerEvent, agent_id: Option<Uuid>) -> bool {
+    let Some(agent_id) = agent_id else {
+        return true;
+    };
+
+    match event {
+        WsServerEvent::Snapshot { .. } | WsServerEvent::Error { .. } => true,
+        WsServerEvent::TickSkipped {
+            agent_id: event_agent_id,
+            ..
+        } => *event_agent_id == agent_id,
+        WsServerEvent::EventAppended { item } => item.agent_id == Some(agent_id),
     }
 }
 

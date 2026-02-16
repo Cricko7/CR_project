@@ -196,6 +196,77 @@ impl AgentCoreRepository for PostgresAgentCoreRepository {
         Ok(rows.into_iter().map(map_agent_event_record).collect())
     }
 
+    async fn list_agent_events_after_id(
+        &self,
+        agent_id: Option<Uuid>,
+        after_id: i64,
+        limit: u32,
+    ) -> Result<Vec<AgentEventRecord>> {
+        let rows = if let Some(agent_id) = agent_id {
+            sqlx::query(
+                r#"
+                SELECT id, agent_id, event_type, description, payload_json, occurred_at
+                FROM events
+                WHERE agent_id = $1
+                  AND id > $2
+                ORDER BY id ASC
+                LIMIT $3
+                "#,
+            )
+            .bind(agent_id)
+            .bind(after_id)
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await
+            .context("failed to list events after id by agent id")?
+        } else {
+            sqlx::query(
+                r#"
+                SELECT id, agent_id, event_type, description, payload_json, occurred_at
+                FROM events
+                WHERE id > $1
+                ORDER BY id ASC
+                LIMIT $2
+                "#,
+            )
+            .bind(after_id)
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await
+            .context("failed to list events after id")?
+        };
+
+        Ok(rows.into_iter().map(map_agent_event_record).collect())
+    }
+
+    async fn latest_event_id(&self, agent_id: Option<Uuid>) -> Result<Option<i64>> {
+        let row = if let Some(agent_id) = agent_id {
+            sqlx::query(
+                r#"
+                SELECT MAX(id) AS latest_id
+                FROM events
+                WHERE agent_id = $1
+                "#,
+            )
+            .bind(agent_id)
+            .fetch_one(&self.pool)
+            .await
+            .context("failed to fetch latest event id by agent id")?
+        } else {
+            sqlx::query(
+                r#"
+                SELECT MAX(id) AS latest_id
+                FROM events
+                "#,
+            )
+            .fetch_one(&self.pool)
+            .await
+            .context("failed to fetch latest event id")?
+        };
+
+        Ok(row.get::<Option<i64>, _>("latest_id"))
+    }
+
     async fn has_completed_tick(&self, agent_id: Uuid, tick_id: &str) -> Result<bool> {
         let row = sqlx::query(
             r#"

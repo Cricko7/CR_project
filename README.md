@@ -24,7 +24,7 @@ Backend для симуляции мира автономных AI-агенто�
 | 2. Эмоциональный интеллект | `FULLY IMPLEMENTED` | Реализована динамика эмоций на каждом тике (summary + personality traits -> valence/arousal/mood), а также периодический mood decay к нейтрали в worker |
 | 3. Архитектура агента (рефлексия→цель→действие) | `FULLY IMPLEMENTED` | Tick pipeline декомпозирован на 4 стадии: reflection, goal selection, action planning, execution + side effects; результат и stage-trace пишутся в event payload |
 | 4. Мультиагентность (общение, отношения) | `FULLY IMPLEMENTED` | Реализованы API отправки/чтения сообщений, worker delivery lifecycle (`queued -> processing -> delivered/failed`) и автоматическое обновление `relationships` (affinity + history) при доставке |
-| 5. Real-time dashboard life feed | `PARTIAL` | Есть `/events` + `/ws/events`; живой WS-пуш пока только для тиков, инициированных через API |
+| 5. Real-time dashboard life feed | `FULLY IMPLEMENTED` | Реализован единый live feed через `/ws/events` для событий из API и worker (DB tail bridge), а также cursor polling через `/events?after_id=...` |
 | 6. Граф отношений | `PARTIAL` | Есть базовый API списка отношений и обновление affinity/history от сообщений; нет graph-агрегаций и live graph stream |
 | 7. Inspector агента | `PARTIAL` | Есть `/agents/{id}/state`, memory recall; агрегированного "профиля агента" endpoint пока нет |
 | 8. Панель вмешательства | `PARTIAL` | Есть endpoint ручного тика и memory append; отдельные intervention endpoints пока не готовы |
@@ -235,12 +235,10 @@ CR_project/
 ### 7.4 WebSocket flow
 1. Клиент подключается к `/ws/events`.
 2. Получает snapshot последних events.
-3. Получает live-сообщения из in-memory `broadcast` hub.
-4. При лаге клиента соединение закрывается с ошибкой stream lagged.
-
-Ограничение:
-- live WS сейчас публикуется только для тиков, инициированных в API процессе.
-- события, созданные worker-ом, в тот же момент через WS не пушатся (видны через snapshot/polling).
+3. API-процесс запускает `event_bridge_worker`, который tail-ит таблицу `events` из Postgres по курсору `events.id`.
+4. Bridge публикует новые события в in-memory `broadcast` hub и WS-клиенты получают их в real-time.
+5. Клиент при необходимости фильтрует/запрашивает только одного агента через `agent_id`.
+6. При лаге клиента соединение закрывается с ошибкой stream lagged.
 
 ### 7.5 Message/relationship flow
 1. API `POST /agents/{receiver_id}/messages` добавляет запись в `messages` со статусом `queued`.
@@ -333,7 +331,11 @@ Response (`200`):
 
 ### 8.4 Events feed
 
-#### `GET /events?agent_id=<uuid>&limit=<1..200>`
+#### `GET /events?agent_id=<uuid>&limit=<1..200>&after_id=<event_id>`
+
+Поведение:
+- без `after_id`: возвращаются последние события (как раньше), `ORDER BY occurred_at DESC`;
+- с `after_id`: cursor-mode для dashboard polling, возвращаются события `id > after_id`, `ORDER BY id ASC`, и выдается `next_after_id`.
 
 Response:
 ```json
@@ -347,7 +349,8 @@ Response:
       "payload": "{\"tick_id\":\"...\"}",
       "occurred_at": "2026-02-16T12:00:00Z"
     }
-  ]
+  ],
+  "next_after_id": 1
 }
 ```
 
@@ -533,7 +536,7 @@ Response:
 
 Server event envelope (`snake_case`, `type` discriminator):
 - `snapshot`
-- `tick_applied`
+- `event_appended`
 - `tick_skipped`
 - `error`
 
@@ -544,13 +547,15 @@ Examples:
 
 ```json
 {
-  "type":"tick_applied",
-  "agent_id":"uuid",
-  "tick_id":"...",
-  "event_id":123,
-  "mood_label":"neutral",
-  "valence":0.0,
-  "arousal":0.0
+  "type":"event_appended",
+  "item": {
+    "id": 123,
+    "agent_id": "uuid",
+    "event_type": "agent.tick.executed",
+    "description": "Agent `Alice` executed tick ...",
+    "payload": "{\"tick_id\":\"...\"}",
+    "occurred_at": "2026-02-16T12:00:00Z"
+  }
 }
 ```
 
@@ -617,6 +622,8 @@ Payload в point:
 |---|---|
 | `API_HOST` | `0.0.0.0` |
 | `API_PORT` | `8080` |
+| `API_EVENT_BRIDGE_INTERVAL_MS` | `500` |
+| `API_EVENT_BRIDGE_BATCH_SIZE` | `128` |
 
 ### 10.3 Database
 
@@ -702,6 +709,8 @@ set DATABASE_URL=postgres://postgres:postgres@localhost:5432/sim
 set DATABASE_RUN_MIGRATIONS=true
 set API_HOST=127.0.0.1
 set API_PORT=8080
+set API_EVENT_BRIDGE_INTERVAL_MS=500
+set API_EVENT_BRIDGE_BATCH_SIZE=128
 set WORKER_AGENT_IDS=<uuid1>,<uuid2>
 set WORKER_TICK_CONCURRENCY=8
 set WORKER_MOOD_DECAY_STEP=0.06
@@ -769,7 +778,7 @@ VALUES
 1. **Нет аутентификации/авторизации** API и WS.
 2. **Нет rate limiting** на дорогие endpoint'ы (`/ticks`, `/messages/*`, `/memories/*`, `/process-embeddings`).
 3. **Нет tenant isolation** (single-world assumptions).
-4. **In-memory WS hub** не защищен и не масштабируется межинстансно.
+4. **WS feed без durable delivery**: нет клиентских ack/offset storage, при disconnect нужен reconnect + catch-up.
 5. **Нет секрет-менеджмента** (Vault/KMS), только env vars.
 6. **Нет audit trail** действий админа на уровне API policy.
 
@@ -794,7 +803,7 @@ VALUES
 
 ### Пропущенные failure modes
 1. **Qdrant/Gemini partial outage**: нет circuit breaker / backpressure policy.
-2. **WS live consistency**: worker-generated events не попадают в live hub API процесса.
+2. **Durable client delivery**: WS feed не хранит пер-клиент offsets/acks; при disconnect нужен reconnect + snapshot/cursor catch-up.
 
 ---
 
@@ -845,8 +854,7 @@ VALUES
    - interventions (add event, send message);
    - agent inspector aggregate endpoint.
 3. Расширить message pipeline до гарантированной доставки (retry/DLQ/ack semantics на уровне сообщений).
-4. Сделать live updates для worker-событий в WS через общий pub/sub, а не process-local hub.
-5. Доработать policy-слой эмоционального интеллекта (domain-specific rules per world/agent class).
+4. Доработать policy-слой эмоционального интеллекта (domain-specific rules per world/agent class).
 
 ### P1 (нужно для полноты симуляции)
 1. Добавить policy-конфиг для stage pipeline (пер-агентные ограничения/приоритеты целей).
