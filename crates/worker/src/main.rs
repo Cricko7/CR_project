@@ -1,13 +1,22 @@
+use std::sync::Arc;
+
+use sim_backend::agent_core::{
+    AgentCoreRepository, AgentTickExecutionStatus, AgentTickOrchestrator,
+    AgentTickOrchestratorOutcome,
+};
 use sim_backend::app::config::WorkerConfig;
 use sim_backend::app::observability::init_tracing;
 use sim_backend::app::runtime::ServiceRuntime;
-use sim_backend::infrastructure::postgres::ensure_ready;
+use sim_backend::infrastructure::postgres::{PostgresAgentCoreRepository, ensure_ready};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let config = WorkerConfig::from_env()?;
     init_tracing(&config.common.service_name, &config.common.log_level)?;
-    let _db_pool = ensure_ready(&config.database).await?;
+    let db_pool = ensure_ready(&config.database).await?;
+    let repository: Arc<dyn AgentCoreRepository> =
+        Arc::new(PostgresAgentCoreRepository::new(db_pool));
+    let orchestrator = AgentTickOrchestrator::new(repository);
 
     let mut runtime = ServiceRuntime::new(
         config.common.service_name.clone(),
@@ -16,8 +25,16 @@ async fn main() -> anyhow::Result<()> {
     let cancellation = runtime.cancellation_token();
 
     let tick_interval = config.tick_interval;
+    let agent_ids = config.agent_ids.clone();
+    let tick_orchestrator = orchestrator.clone();
     let tick_token = cancellation.clone();
     runtime.spawn("agent_tick_worker", async move {
+        if agent_ids.is_empty() {
+            tracing::warn!(
+                "WORKER_AGENT_IDS is empty; tick worker is idle until agent ids are configured"
+            );
+        }
+
         let mut interval = tokio::time::interval(tick_interval);
         loop {
             tokio::select! {
@@ -26,7 +43,39 @@ async fn main() -> anyhow::Result<()> {
                     break;
                 }
                 _ = interval.tick() => {
-                    tracing::info!("agent tick");
+                    for agent_id in &agent_ids {
+                        match tick_orchestrator.run_agent_tick(*agent_id, None).await {
+                            Ok(AgentTickOrchestratorOutcome::Executed(result)) => {
+                                match result.status {
+                                    AgentTickExecutionStatus::Applied => {
+                                        tracing::info!(
+                                            agent_id = %result.agent_id,
+                                            tick_id = %result.tick_id,
+                                            event_id = ?result.event_id,
+                                            mood = %result.mood_label,
+                                            "agent tick applied"
+                                        );
+                                    }
+                                    AgentTickExecutionStatus::AgentMissing => {
+                                        tracing::warn!(
+                                            agent_id = %result.agent_id,
+                                            tick_id = %result.tick_id,
+                                            "agent not found for tick"
+                                        );
+                                    }
+                                }
+                            }
+                            Ok(AgentTickOrchestratorOutcome::SkippedBusy) => {
+                                tracing::debug!(agent_id = %agent_id, "skipped busy agent tick");
+                            }
+                            Ok(AgentTickOrchestratorOutcome::SkippedDuplicate) => {
+                                tracing::debug!(agent_id = %agent_id, "skipped duplicate agent tick");
+                            }
+                            Err(error) => {
+                                tracing::error!(agent_id = %agent_id, error = %error, "agent tick failed");
+                            }
+                        }
+                    }
                 }
             }
         }

@@ -4,6 +4,8 @@ use std::fmt::{Display, Formatter};
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
+use uuid::Uuid;
+
 const DEFAULT_SERVICE_NAME: &str = "sim-backend";
 const DEFAULT_LOG_LEVEL: &str = "info";
 const DEFAULT_HOST: &str = "0.0.0.0";
@@ -74,6 +76,7 @@ impl ApiConfig {
 pub struct WorkerConfig {
     pub common: CommonConfig,
     pub database: DatabaseConfig,
+    pub agent_ids: Vec<Uuid>,
     pub tick_interval: Duration,
     pub mood_decay_interval: Duration,
 }
@@ -82,6 +85,7 @@ impl WorkerConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
         let common = load_common_config("sim-worker")?;
         let database = load_database_config()?;
+        let agent_ids = parse_uuid_list_env("WORKER_AGENT_IDS")?;
         let tick_interval_ms: u64 =
             parse_env("WORKER_TICK_INTERVAL_MS", DEFAULT_WORKER_TICK_INTERVAL_MS)?;
         let mood_decay_interval_ms: u64 =
@@ -103,6 +107,7 @@ impl WorkerConfig {
         Ok(Self {
             common,
             database,
+            agent_ids,
             tick_interval: Duration::from_millis(tick_interval_ms),
             mood_decay_interval: Duration::from_millis(mood_decay_interval_ms),
         })
@@ -216,6 +221,19 @@ fn validate_log_level(raw: &str) -> Result<(), ConfigError> {
             "must be one of trace|debug|info|warn|error",
         ))
     }
+}
+
+fn parse_uuid_list_env(key: &'static str) -> Result<Vec<Uuid>, ConfigError> {
+    let raw = env::var(key).unwrap_or_default();
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    raw.split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(|token| Uuid::parse_str(token).map_err(|error| ConfigError::parse(key, error.to_string())))
+        .collect()
 }
 
 fn parse_env<T>(key: &'static str, default: T) -> Result<T, ConfigError>
