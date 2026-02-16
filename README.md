@@ -26,7 +26,7 @@ Backend для симуляции мира автономных AI-агенто�
 | 4. Мультиагентность (общение, отношения) | `FULLY IMPLEMENTED` | Реализованы API отправки/чтения сообщений, worker delivery lifecycle (`queued -> processing -> delivered/failed`) и автоматическое обновление `relationships` (affinity + history) при доставке |
 | 5. Real-time dashboard life feed | `FULLY IMPLEMENTED` | Реализован единый live feed через `/ws/events` для событий из API и worker (DB tail bridge), а также cursor polling через `/events?after_id=...` |
 | 6. Граф отношений | `FULLY IMPLEMENTED` | Есть graph snapshot API (`/relationships/graph`) и live stream (`/ws/relationships`); worker публикует `agent.relationship.updated` события |
-| 7. Inspector агента | `PARTIAL` | Есть `/agents/{id}/state`, memory recall; агрегированного "профиля агента" endpoint пока нет |
+| 7. Inspector агента | `FULLY IMPLEMENTED` | Есть агрегирующий endpoint `/agents/{id}/inspector` (agent profile + state + recent events/messages/relationships/memories + optional recall) |
 | 8. Панель вмешательства | `PARTIAL` | Есть endpoint ручного тика и memory append; отдельные intervention endpoints пока не готовы |
 | Доп. фича 1: настроение влияет на стиль речи | `PARTIAL` | Mood передается в prompt, но полноценные style policies не оформлены |
 | Доп. фича 2: страница агента с историей отношений | `PARTIAL` | Backend API для отношений есть; нужен frontend-экран и timeline-агрегации |
@@ -257,6 +257,12 @@ CR_project/
    - получать snapshot графа через `GET /relationships/graph`;
    - получать live edge updates через `GET /ws/relationships`.
 
+### 7.7 Inspector flow
+1. Клиент вызывает `GET /agents/{id}/inspector`.
+2. API параллельно читает: profile/state/events/messages/relationships/memories.
+3. При наличии `recall_query` API дополнительно запускает vector recall и включает блок релевантных memories.
+4. Dashboard получает готовый агрегированный срез для страницы агента одним запросом.
+
 ---
 
 ## 8. API Reference (текущее)
@@ -333,6 +339,45 @@ Response (`200`):
   "valence": 0.0,
   "arousal": 0.0,
   "updated_at": "2026-02-16T12:00:00Z"
+}
+```
+
+### 8.3.1 Agent Inspector Profile
+
+#### `GET /agents/{id}/inspector?events_limit=<1..200>&messages_limit=<1..200>&relationships_limit=<1..200>&memories_limit=<1..200>&recall_query=...&recall_top_k=<1..50>`
+
+Response:
+```json
+{
+  "agent": {
+    "id": "uuid",
+    "name": "Alice",
+    "avatar_url": null,
+    "personality_json": {"traits":["curious","friendly"]},
+    "created_at": "2026-02-16T12:00:00Z"
+  },
+  "state": {
+    "agent_id": "uuid",
+    "mood_label": "calm",
+    "valence": 0.22,
+    "arousal": -0.04,
+    "updated_at": "2026-02-16T12:04:00Z"
+  },
+  "summary": {
+    "events_count": 20,
+    "messages_count": 10,
+    "relationships_count": 5,
+    "memories_count": 20
+  },
+  "recent_events": [...],
+  "recent_messages": [...],
+  "recent_relationships": [...],
+  "recent_memories": [...],
+  "recall": {
+    "query": "recent conflict",
+    "top_k": 8,
+    "items": [...]
+  }
 }
 ```
 
@@ -910,7 +955,7 @@ VALUES
    - vector recall;
    - overflow summarization.
 7. Qdrant adapter и Gemini adapters.
-8. REST endpoints для state/events/memory/ticks/messages/relationships + relationship graph snapshot.
+8. REST endpoints для state/events/memory/ticks/messages/relationships + relationship graph snapshot + agent inspector profile.
 9. WebSocket endpoints `/ws/events` и `/ws/relationships` с snapshot + live updates.
 10. Worker циклы: ticks, mood-decay, message delivery, embedding, summarization.
 11. Миграции для базовой схемы, long-term memory, concurrency/failure hardening и мультиагентной коммуникации.
@@ -925,8 +970,7 @@ VALUES
 ### P0 (обязательно для демонстрации целевого кейса)
 1. Реализовать auth (JWT/API key) для admin операций.
 2. Добавить CRUD/API для:
-   - interventions (add event, send message);
-   - agent inspector aggregate endpoint.
+   - interventions (add event, send message).
 3. Расширить message pipeline до гарантированной доставки (retry/DLQ/ack semantics на уровне сообщений).
 4. Доработать policy-слой эмоционального интеллекта (domain-specific rules per world/agent class).
 

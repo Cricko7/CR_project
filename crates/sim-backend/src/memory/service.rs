@@ -226,6 +226,14 @@ impl MemoryService {
         self.repository.list_dead_letter_embeddings(limit).await
     }
 
+    pub async fn list_recent_memories(
+        &self,
+        agent_id: Uuid,
+        limit: u32,
+    ) -> Result<Vec<MemoryEntryRecord>> {
+        self.repository.list_recent_memories(agent_id, limit).await
+    }
+
     pub async fn requeue_dead_letter_embedding(&self, memory_id: i64) -> Result<bool> {
         self.repository
             .requeue_dead_letter_embedding(memory_id)
@@ -504,6 +512,22 @@ mod tests {
                 .iter()
                 .filter(|row| row.agent_id == agent_id && !row.archived && !row.is_summary)
                 .count() as u64)
+        }
+
+        async fn list_recent_memories(
+            &self,
+            agent_id: Uuid,
+            limit: u32,
+        ) -> Result<Vec<MemoryEntryRecord>> {
+            let rows = self.rows.lock().await;
+            let mut values: Vec<MemoryEntryRecord> = rows
+                .iter()
+                .filter(|row| row.agent_id == agent_id && !row.archived)
+                .cloned()
+                .collect();
+            values.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+            values.truncate(limit as usize);
+            Ok(values)
         }
 
         async fn archive_memories(&self, ids: &[i64], _summarized_by_id: i64) -> Result<()> {

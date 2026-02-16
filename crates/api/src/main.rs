@@ -12,6 +12,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sim_backend::agent_core::{
     AgentCoreRepository, AgentEventRecord, AgentTickExecutionStatus, AgentTickOrchestrator,
     AgentTickOrchestratorOutcome, MessageRecord, NewMessage, RelationshipRecord,
@@ -37,6 +38,7 @@ const EVENT_HUB_CAPACITY: usize = 512;
 const DEFAULT_WS_SNAPSHOT_LIMIT: u32 = 20;
 const DEFAULT_RECALL_TOP_K: u32 = 8;
 const DEFAULT_RELATIONSHIP_GRAPH_LIMIT: u32 = 200;
+const DEFAULT_INSPECTOR_LIMIT: u32 = 20;
 
 #[derive(Clone)]
 struct ApiState {
@@ -107,6 +109,63 @@ struct AgentStateResponse {
     valence: f32,
     arousal: f32,
     updated_at: String,
+}
+
+#[derive(Deserialize)]
+struct AgentInspectorQuery {
+    events_limit: Option<u32>,
+    messages_limit: Option<u32>,
+    relationships_limit: Option<u32>,
+    memories_limit: Option<u32>,
+    recall_query: Option<String>,
+    recall_top_k: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct AgentInspectorResponse {
+    agent: AgentInspectorAgentResponse,
+    state: Option<AgentStateResponse>,
+    recent_events: Vec<EventItemResponse>,
+    recent_messages: Vec<MessageItemResponse>,
+    recent_relationships: Vec<RelationshipItemResponse>,
+    recent_memories: Vec<InspectorMemoryItemResponse>,
+    recall: Option<AgentInspectorRecallResponse>,
+    summary: AgentInspectorSummaryResponse,
+}
+
+#[derive(Serialize)]
+struct AgentInspectorAgentResponse {
+    id: Uuid,
+    name: String,
+    avatar_url: Option<String>,
+    personality_json: Value,
+    created_at: String,
+}
+
+#[derive(Serialize)]
+struct InspectorMemoryItemResponse {
+    memory_id: i64,
+    content: String,
+    summary: Option<String>,
+    importance: f32,
+    is_summary: bool,
+    embedding_status: String,
+    created_at: String,
+}
+
+#[derive(Serialize)]
+struct AgentInspectorRecallResponse {
+    query: String,
+    top_k: u32,
+    items: Vec<RecallItemResponse>,
+}
+
+#[derive(Serialize)]
+struct AgentInspectorSummaryResponse {
+    events_count: usize,
+    messages_count: usize,
+    relationships_count: usize,
+    memories_count: usize,
 }
 
 #[derive(Serialize)]
@@ -401,6 +460,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/livez", get(health))
         .route("/agents/{id}/ticks", post(trigger_agent_tick))
         .route("/agents/{id}/state", get(get_agent_state))
+        .route("/agents/{id}/inspector", get(get_agent_inspector))
         .route("/events", get(list_events))
         .route("/relationships/graph", get(get_relationship_graph))
         .route("/agents/{id}/memories", post(append_agent_memory))
@@ -666,6 +726,164 @@ async fn get_agent_state(
         valence: record.valence,
         arousal: record.arousal,
         updated_at: record.updated_at.to_rfc3339(),
+    }))
+}
+
+async fn get_agent_inspector(
+    State(state): State<ApiState>,
+    Path(agent_id): Path<Uuid>,
+    Query(query): Query<AgentInspectorQuery>,
+) -> Result<Json<AgentInspectorResponse>, (StatusCode, Json<ApiErrorResponse>)> {
+    let events_limit = query
+        .events_limit
+        .unwrap_or(DEFAULT_INSPECTOR_LIMIT)
+        .clamp(1, 200);
+    let messages_limit = query
+        .messages_limit
+        .unwrap_or(DEFAULT_INSPECTOR_LIMIT)
+        .clamp(1, 200);
+    let relationships_limit = query
+        .relationships_limit
+        .unwrap_or(DEFAULT_INSPECTOR_LIMIT)
+        .clamp(1, 200);
+    let memories_limit = query
+        .memories_limit
+        .unwrap_or(DEFAULT_INSPECTOR_LIMIT)
+        .clamp(1, 200);
+    let recall_query = query
+        .recall_query
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let recall_top_k = query
+        .recall_top_k
+        .unwrap_or(DEFAULT_RECALL_TOP_K)
+        .clamp(1, 50);
+
+    let repository = state.repository.clone();
+    let memory_service = state.memory_service.clone();
+
+    let (
+        agent_result,
+        state_result,
+        events_result,
+        messages_result,
+        relationships_result,
+        memories_result,
+    ) = tokio::join!(
+        repository.get_agent(agent_id),
+        repository.get_agent_state(agent_id),
+        repository.list_agent_events(Some(agent_id), events_limit),
+        repository.list_agent_messages(agent_id, messages_limit),
+        repository.list_agent_relationships(agent_id, relationships_limit),
+        memory_service.list_recent_memories(agent_id, memories_limit),
+    );
+
+    let Some(agent) = agent_result.map_err(|error| {
+        internal_error(
+            "inspector_read_failed",
+            format!("failed to read agent profile: {error}"),
+        )
+    })?
+    else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiErrorResponse {
+                error: "agent_not_found",
+                message: format!("agent `{agent_id}` does not exist"),
+            }),
+        ));
+    };
+
+    let state_item = state_result
+        .map_err(|error| {
+            internal_error(
+                "inspector_read_failed",
+                format!("failed to read agent state: {error}"),
+            )
+        })?
+        .map(|record| AgentStateResponse {
+            agent_id: record.agent_id,
+            mood_label: record.mood_label,
+            valence: record.valence,
+            arousal: record.arousal,
+            updated_at: record.updated_at.to_rfc3339(),
+        });
+
+    let events = events_result.map_err(|error| {
+        internal_error(
+            "inspector_read_failed",
+            format!("failed to read agent events: {error}"),
+        )
+    })?;
+    let messages = messages_result.map_err(|error| {
+        internal_error(
+            "inspector_read_failed",
+            format!("failed to read agent messages: {error}"),
+        )
+    })?;
+    let relationships = relationships_result.map_err(|error| {
+        internal_error(
+            "inspector_read_failed",
+            format!("failed to read agent relationships: {error}"),
+        )
+    })?;
+    let memories = memories_result.map_err(|error| {
+        internal_error(
+            "inspector_read_failed",
+            format!("failed to read agent memories: {error}"),
+        )
+    })?;
+
+    let recall = if let Some(recall_query) = recall_query {
+        let recalled = state
+            .memory_service
+            .recall(agent_id, &recall_query, recall_top_k)
+            .await
+            .map_err(|error| {
+                internal_error(
+                    "inspector_recall_failed",
+                    format!("failed to run inspector memory recall: {error}"),
+                )
+            })?;
+        Some(AgentInspectorRecallResponse {
+            query: recall_query,
+            top_k: recall_top_k,
+            items: recalled.into_iter().map(map_recall_item).collect(),
+        })
+    } else {
+        None
+    };
+
+    let recent_events: Vec<EventItemResponse> = events.iter().map(map_event_record).collect();
+    let recent_messages: Vec<MessageItemResponse> =
+        messages.into_iter().map(map_message_record).collect();
+    let recent_relationships: Vec<RelationshipItemResponse> = relationships
+        .into_iter()
+        .map(map_relationship_record)
+        .collect();
+    let recent_memories: Vec<InspectorMemoryItemResponse> =
+        memories.into_iter().map(map_inspector_memory).collect();
+
+    Ok(Json(AgentInspectorResponse {
+        agent: AgentInspectorAgentResponse {
+            id: agent.id,
+            name: agent.name,
+            avatar_url: agent.avatar_url,
+            personality_json: agent.personality_json,
+            created_at: agent.created_at.to_rfc3339(),
+        },
+        state: state_item,
+        summary: AgentInspectorSummaryResponse {
+            events_count: recent_events.len(),
+            messages_count: recent_messages.len(),
+            relationships_count: recent_relationships.len(),
+            memories_count: recent_memories.len(),
+        },
+        recent_events,
+        recent_messages,
+        recent_relationships,
+        recent_memories,
+        recall,
     }))
 }
 
@@ -1374,6 +1592,18 @@ fn map_dead_letter_memory(memory: MemoryEntryRecord) -> DeadLetterEmbeddingItemR
         importance: memory.importance,
         created_at: memory.created_at.to_rfc3339(),
         embedding_status: memory.embedding_status,
+    }
+}
+
+fn map_inspector_memory(memory: MemoryEntryRecord) -> InspectorMemoryItemResponse {
+    InspectorMemoryItemResponse {
+        memory_id: memory.id,
+        content: memory.content,
+        summary: memory.summary,
+        importance: memory.importance,
+        is_summary: memory.is_summary,
+        embedding_status: memory.embedding_status,
+        created_at: memory.created_at.to_rfc3339(),
     }
 }
 

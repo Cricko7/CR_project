@@ -55,6 +55,11 @@ pub trait MemoryRepository: Send + Sync {
         agent_id: Uuid,
         limit: u32,
     ) -> Result<Vec<MemoryEntryRecord>>;
+    async fn list_recent_memories(
+        &self,
+        agent_id: Uuid,
+        limit: u32,
+    ) -> Result<Vec<MemoryEntryRecord>>;
     async fn count_active_memories(&self, agent_id: Uuid) -> Result<u64>;
     async fn archive_memories(&self, ids: &[i64], summarized_by_id: i64) -> Result<()>;
 }

@@ -263,6 +263,30 @@ impl MemoryRepository for PostgresMemoryRepository {
         Ok(total.max(0) as u64)
     }
 
+    async fn list_recent_memories(
+        &self,
+        agent_id: Uuid,
+        limit: u32,
+    ) -> Result<Vec<MemoryEntryRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, agent_id, content, summary, importance, is_summary, archived, embedding_status, created_at
+            FROM memory_entries
+            WHERE agent_id = $1
+              AND archived = FALSE
+            ORDER BY created_at DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(agent_id)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list recent memories")?;
+
+        Ok(rows.into_iter().map(map_memory_entry).collect())
+    }
+
     async fn archive_memories(&self, ids: &[i64], summarized_by_id: i64) -> Result<()> {
         if ids.is_empty() {
             return Ok(());
