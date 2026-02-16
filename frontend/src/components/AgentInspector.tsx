@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useCyberLife } from '../hooks/useCyberLife';
 import { InspectorResponse } from '../types/api';
-import { X, MessageSquare, Brain } from 'lucide-react';
+import { X, Brain } from 'lucide-react';
 
 interface Props {
   agentId: string;
