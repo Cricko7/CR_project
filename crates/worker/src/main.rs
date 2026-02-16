@@ -357,6 +357,29 @@ async fn process_agent_message(repository: &dyn AgentCoreRepository, message: &M
                 affinity = relationship.affinity_score,
                 "relationship updated from delivered message"
             );
+
+            repository
+                .append_agent_event(&NewAgentEvent {
+                    agent_id: None,
+                    event_type: "agent.relationship.updated".to_owned(),
+                    description: format!(
+                        "Relationship updated between `{}` and `{}`",
+                        relationship.agent_a, relationship.agent_b
+                    ),
+                    payload_json: json!({
+                        "relationship_id": relationship.id,
+                        "agent_a": relationship.agent_a,
+                        "agent_b": relationship.agent_b,
+                        "affinity_score": relationship.affinity_score,
+                        "history_summary": relationship.history_summary,
+                        "last_interaction_at": relationship
+                            .last_interaction_at
+                            .map(|value| value.to_rfc3339()),
+                        "created_at": relationship.created_at.to_rfc3339(),
+                        "trigger_message_id": message.id,
+                    }),
+                })
+                .await?;
         }
 
         repository.mark_message_delivered(message.id).await?;

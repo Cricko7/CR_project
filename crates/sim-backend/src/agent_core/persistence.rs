@@ -131,4 +131,5 @@ pub trait AgentCoreRepository: Send + Sync {
         agent_id: Uuid,
         limit: u32,
     ) -> Result<Vec<RelationshipRecord>>;
+    async fn list_relationships(&self, limit: u32) -> Result<Vec<RelationshipRecord>>;
 }

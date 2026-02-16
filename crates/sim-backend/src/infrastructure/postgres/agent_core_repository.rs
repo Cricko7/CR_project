@@ -565,6 +565,23 @@ impl AgentCoreRepository for PostgresAgentCoreRepository {
 
         Ok(rows.into_iter().map(map_relationship_record).collect())
     }
+
+    async fn list_relationships(&self, limit: u32) -> Result<Vec<RelationshipRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, agent_a, agent_b, affinity_score, history_summary, last_interaction_at, created_at
+            FROM relationships
+            ORDER BY COALESCE(last_interaction_at, created_at) DESC
+            LIMIT $1
+            "#,
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list relationships")?;
+
+        Ok(rows.into_iter().map(map_relationship_record).collect())
+    }
 }
 
 fn map_agent_record(row: sqlx::postgres::PgRow) -> AgentRecord {

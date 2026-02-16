@@ -933,6 +933,10 @@ mod tests {
         ) -> Result<Vec<RelationshipRecord>> {
             Ok(Vec::new())
         }
+
+        async fn list_relationships(&self, _limit: u32) -> Result<Vec<RelationshipRecord>> {
+            Ok(Vec::new())
+        }
     }
 
     #[tokio::test]

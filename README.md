@@ -25,7 +25,7 @@ Backend для симуляции мира автономных AI-агенто�
 | 3. Архитектура агента (рефлексия→цель→действие) | `FULLY IMPLEMENTED` | Tick pipeline декомпозирован на 4 стадии: reflection, goal selection, action planning, execution + side effects; результат и stage-trace пишутся в event payload |
 | 4. Мультиагентность (общение, отношения) | `FULLY IMPLEMENTED` | Реализованы API отправки/чтения сообщений, worker delivery lifecycle (`queued -> processing -> delivered/failed`) и автоматическое обновление `relationships` (affinity + history) при доставке |
 | 5. Real-time dashboard life feed | `FULLY IMPLEMENTED` | Реализован единый live feed через `/ws/events` для событий из API и worker (DB tail bridge), а также cursor polling через `/events?after_id=...` |
-| 6. Граф отношений | `PARTIAL` | Есть базовый API списка отношений и обновление affinity/history от сообщений; нет graph-агрегаций и live graph stream |
+| 6. Граф отношений | `FULLY IMPLEMENTED` | Есть graph snapshot API (`/relationships/graph`) и live stream (`/ws/relationships`); worker публикует `agent.relationship.updated` события |
 | 7. Inspector агента | `PARTIAL` | Есть `/agents/{id}/state`, memory recall; агрегированного "профиля агента" endpoint пока нет |
 | 8. Панель вмешательства | `PARTIAL` | Есть endpoint ручного тика и memory append; отдельные intervention endpoints пока не готовы |
 | Доп. фича 1: настроение влияет на стиль речи | `PARTIAL` | Mood передается в prompt, но полноценные style policies не оформлены |
@@ -250,6 +250,13 @@ CR_project/
    - success -> `delivered`;
    - failure -> `failed` + `delivery_error`.
 
+### 7.6 Relationship graph feed flow
+1. Worker при изменении affinity/history пишет доменное событие `agent.relationship.updated` в `events`.
+2. API `event_bridge_worker` tail-ит `events` и публикует relationship updates в WS-hub.
+3. Dashboard может:
+   - получать snapshot графа через `GET /relationships/graph`;
+   - получать live edge updates через `GET /ws/relationships`.
+
 ---
 
 ## 8. API Reference (текущее)
@@ -416,7 +423,40 @@ Response:
 }
 ```
 
-### 8.8 Memory append
+### 8.8 Relationship graph snapshot
+
+#### `GET /relationships/graph?agent_id=<uuid>&limit_edges=<1..500>`
+
+Response:
+```json
+{
+  "nodes": [
+    {
+      "agent_id": "uuid-a",
+      "name": "Alice",
+      "avatar_url": null
+    },
+    {
+      "agent_id": "uuid-b",
+      "name": "Bob",
+      "avatar_url": null
+    }
+  ],
+  "edges": [
+    {
+      "id": 5,
+      "agent_a": "uuid-a",
+      "agent_b": "uuid-b",
+      "affinity_score": 0.32,
+      "history_summary": "Let's cooperate on exploring the market.",
+      "last_interaction_at": "2026-02-16T12:00:01Z",
+      "created_at": "2026-02-16T12:00:01Z"
+    }
+  ]
+}
+```
+
+### 8.9 Memory append
 
 #### `POST /agents/{id}/memories`
 
@@ -436,7 +476,7 @@ Response (`201`):
 }
 ```
 
-### 8.9 Memory recall
+### 8.10 Memory recall
 
 #### `GET /agents/{id}/memories/recall?query=...&top_k=8`
 
@@ -456,7 +496,7 @@ Response:
 }
 ```
 
-### 8.10 Manual summarization
+### 8.11 Manual summarization
 
 #### `POST /agents/{id}/memories/summarize`
 
@@ -477,7 +517,7 @@ Response:
 }
 ```
 
-### 8.11 Manual embedding processing
+### 8.12 Manual embedding processing
 
 #### `POST /memory/process-embeddings`
 
@@ -499,7 +539,7 @@ Response:
 }
 ```
 
-### 8.12 Dead-letter embeddings
+### 8.13 Dead-letter embeddings
 
 #### `GET /memory/dead-letter?limit=<1..200>`
 
@@ -530,7 +570,7 @@ Response:
 }
 ```
 
-### 8.13 WebSocket events
+### 8.14 WebSocket events
 
 #### `GET /ws/events?agent_id=<uuid>&snapshot_limit=<1..200>`
 
@@ -555,6 +595,41 @@ Examples:
     "description": "Agent `Alice` executed tick ...",
     "payload": "{\"tick_id\":\"...\"}",
     "occurred_at": "2026-02-16T12:00:00Z"
+  }
+}
+```
+
+### 8.15 WebSocket relationship graph stream
+
+#### `GET /ws/relationships?agent_id=<uuid>&snapshot_limit=<1..500>`
+
+Server event envelope (`snake_case`, `type` discriminator):
+- `snapshot`
+- `edge_updated`
+- `error`
+
+Examples:
+```json
+{
+  "type":"snapshot",
+  "graph":{
+    "nodes":[...],
+    "edges":[...]
+  }
+}
+```
+
+```json
+{
+  "type":"edge_updated",
+  "edge":{
+    "id": 5,
+    "agent_a": "uuid-a",
+    "agent_b": "uuid-b",
+    "affinity_score": 0.40,
+    "history_summary": "Let's cooperate | Thanks for support",
+    "last_interaction_at": "2026-02-16T12:05:01Z",
+    "created_at": "2026-02-16T12:00:01Z"
   }
 }
 ```
@@ -817,7 +892,7 @@ VALUES
 | ADR-004 | Qdrant для долгой памяти | Быстрый vector recall с фильтром по агенту | Отдельный контур отказов |
 | ADR-005 | Gemini как основной LLM+embeddings | Быстрый запуск без self-hosted моделей | Зависимость от внешнего API/квот |
 | ADR-006 | Fallback режим без Gemini | Демо живет даже без API key | Качество summaries/recall ниже |
-| ADR-007 | In-memory WS broadcast в API | Минимальная latency и простота | Не работает межинстансно, нет durable delivery |
+| ADR-007 | WS feed через API hub + DB tail bridge | Простая real-time доставка событий из API и worker без отдельного брокера | Нет durable delivery и client ack/offset storage |
 | ADR-008 | Trait ports для repo/vector/llm | Тестируемость и сменяемость адаптеров | Больше кода и интерфейсных слоев |
 
 ---
@@ -835,8 +910,8 @@ VALUES
    - vector recall;
    - overflow summarization.
 7. Qdrant adapter и Gemini adapters.
-8. REST endpoints для state/events/memory/ticks/messages/relationships.
-9. WebSocket endpoint с snapshot + live events.
+8. REST endpoints для state/events/memory/ticks/messages/relationships + relationship graph snapshot.
+9. WebSocket endpoints `/ws/events` и `/ws/relationships` с snapshot + live updates.
 10. Worker циклы: ticks, mood-decay, message delivery, embedding, summarization.
 11. Миграции для базовой схемы, long-term memory, concurrency/failure hardening и мультиагентной коммуникации.
 12. Unit tests для `agent_core` и `memory`.
@@ -850,7 +925,6 @@ VALUES
 ### P0 (обязательно для демонстрации целевого кейса)
 1. Реализовать auth (JWT/API key) для admin операций.
 2. Добавить CRUD/API для:
-   - relationships graph;
    - interventions (add event, send message);
    - agent inspector aggregate endpoint.
 3. Расширить message pipeline до гарантированной доставки (retry/DLQ/ack semantics на уровне сообщений).

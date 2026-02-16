@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,6 +36,7 @@ use uuid::Uuid;
 const EVENT_HUB_CAPACITY: usize = 512;
 const DEFAULT_WS_SNAPSHOT_LIMIT: u32 = 20;
 const DEFAULT_RECALL_TOP_K: u32 = 8;
+const DEFAULT_RELATIONSHIP_GRAPH_LIMIT: u32 = 200;
 
 #[derive(Clone)]
 struct ApiState {
@@ -238,12 +240,18 @@ struct RelationshipListQuery {
     limit: Option<u32>,
 }
 
+#[derive(Deserialize)]
+struct RelationshipGraphQuery {
+    agent_id: Option<Uuid>,
+    limit_edges: Option<u32>,
+}
+
 #[derive(Serialize)]
 struct AgentRelationshipsResponse {
     items: Vec<RelationshipItemResponse>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct RelationshipItemResponse {
     id: i64,
     agent_a: Uuid,
@@ -254,8 +262,27 @@ struct RelationshipItemResponse {
     created_at: String,
 }
 
+#[derive(Serialize, Clone)]
+struct RelationshipGraphNodeResponse {
+    agent_id: Uuid,
+    name: String,
+    avatar_url: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+struct RelationshipGraphResponse {
+    nodes: Vec<RelationshipGraphNodeResponse>,
+    edges: Vec<RelationshipItemResponse>,
+}
+
 #[derive(Deserialize)]
 struct WsEventsQuery {
+    agent_id: Option<Uuid>,
+    snapshot_limit: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct WsRelationshipsQuery {
     agent_id: Option<Uuid>,
     snapshot_limit: Option<u32>,
 }
@@ -274,9 +301,20 @@ enum WsServerEvent {
     EventAppended {
         item: EventItemResponse,
     },
+    RelationshipUpdated {
+        edge: RelationshipItemResponse,
+    },
     Error {
         message: String,
     },
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum WsRelationshipServerEvent {
+    Snapshot { graph: RelationshipGraphResponse },
+    EdgeUpdated { edge: RelationshipItemResponse },
+    Error { message: String },
 }
 
 #[derive(Clone)]
@@ -364,6 +402,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/agents/{id}/ticks", post(trigger_agent_tick))
         .route("/agents/{id}/state", get(get_agent_state))
         .route("/events", get(list_events))
+        .route("/relationships/graph", get(get_relationship_graph))
         .route("/agents/{id}/memories", post(append_agent_memory))
         .route("/agents/{id}/memories/recall", get(recall_agent_memory))
         .route(
@@ -385,6 +424,7 @@ async fn main() -> anyhow::Result<()> {
             post(requeue_dead_letter_embedding),
         )
         .route("/ws/events", get(ws_events))
+        .route("/ws/relationships", get(ws_relationships))
         .with_state(state);
 
     let socket_addr = config.socket_addr();
@@ -468,9 +508,13 @@ async fn main() -> anyhow::Result<()> {
                         let batch_len = records.len();
                         for record in records {
                             tail_cursor = tail_cursor.max(record.id);
+                            let relationship_update = map_relationship_update_event(&record);
                             event_bridge_hub.publish(WsServerEvent::EventAppended {
-                                item: map_event_record(record),
+                                item: map_event_record(&record),
                             });
+                            if let Some(edge) = relationship_update {
+                                event_bridge_hub.publish(WsServerEvent::RelationshipUpdated { edge });
+                            }
                         }
 
                         if batch_len < event_bridge_batch_size as usize {
@@ -666,7 +710,7 @@ async fn list_events(
         None
     };
 
-    let items = records.into_iter().map(map_event_record).collect();
+    let items = records.iter().map(map_event_record).collect();
 
     Ok(Json(EventsResponse {
         items,
@@ -846,6 +890,27 @@ async fn list_agent_relationships(
     Ok(Json(AgentRelationshipsResponse { items }))
 }
 
+async fn get_relationship_graph(
+    State(state): State<ApiState>,
+    Query(query): Query<RelationshipGraphQuery>,
+) -> Result<Json<RelationshipGraphResponse>, (StatusCode, Json<ApiErrorResponse>)> {
+    let limit_edges = query
+        .limit_edges
+        .unwrap_or(DEFAULT_RELATIONSHIP_GRAPH_LIMIT)
+        .clamp(1, 500);
+
+    let graph = build_relationship_graph(&state, query.agent_id, limit_edges)
+        .await
+        .map_err(|error| {
+            internal_error(
+                "relationship_graph_failed",
+                format!("failed to build relationship graph: {error}"),
+            )
+        })?;
+
+    Ok(Json(graph))
+}
+
 async fn recall_agent_memory(
     State(state): State<ApiState>,
     Path(agent_id): Path<Uuid>,
@@ -988,6 +1053,14 @@ async fn ws_events(
     ws.on_upgrade(move |socket| ws_events_session(socket, state, query))
 }
 
+async fn ws_relationships(
+    State(state): State<ApiState>,
+    Query(query): Query<WsRelationshipsQuery>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| ws_relationships_session(socket, state, query))
+}
+
 async fn ws_events_session(mut socket: WebSocket, state: ApiState, query: WsEventsQuery) {
     let snapshot_limit = query
         .snapshot_limit
@@ -1000,7 +1073,7 @@ async fn ws_events_session(mut socket: WebSocket, state: ApiState, query: WsEven
 
     match snapshot {
         Ok(records) => {
-            let items = records.into_iter().map(map_event_record).collect();
+            let items = records.iter().map(map_event_record).collect();
             let event = WsServerEvent::Snapshot { items };
             if !send_ws_event(&mut socket, &event).await {
                 return;
@@ -1019,6 +1092,9 @@ async fn ws_events_session(mut socket: WebSocket, state: ApiState, query: WsEven
     loop {
         match receiver.recv().await {
             Ok(event) => {
+                if matches!(event, WsServerEvent::RelationshipUpdated { .. }) {
+                    continue;
+                }
                 if !ws_event_matches_agent(&event, query.agent_id) {
                     continue;
                 }
@@ -1036,6 +1112,78 @@ async fn ws_events_session(mut socket: WebSocket, state: ApiState, query: WsEven
                     &WsServerEvent::Error {
                         message: format!(
                             "stream lagged by {skipped} events; reconnect for fresh state"
+                        ),
+                    },
+                )
+                .await;
+                break;
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
+async fn ws_relationships_session(
+    mut socket: WebSocket,
+    state: ApiState,
+    query: WsRelationshipsQuery,
+) {
+    let snapshot_limit = query
+        .snapshot_limit
+        .unwrap_or(DEFAULT_RELATIONSHIP_GRAPH_LIMIT)
+        .clamp(1, 500);
+
+    let snapshot = build_relationship_graph(&state, query.agent_id, snapshot_limit).await;
+    match snapshot {
+        Ok(graph) => {
+            if !send_ws_relationship_event(
+                &mut socket,
+                &WsRelationshipServerEvent::Snapshot { graph },
+            )
+            .await
+            {
+                return;
+            }
+        }
+        Err(error) => {
+            let _ = send_ws_relationship_event(
+                &mut socket,
+                &WsRelationshipServerEvent::Error {
+                    message: format!("failed to load relationship graph snapshot: {error}"),
+                },
+            )
+            .await;
+            return;
+        }
+    }
+
+    let mut receiver = state.event_hub.subscribe();
+    loop {
+        match receiver.recv().await {
+            Ok(WsServerEvent::RelationshipUpdated { edge }) => {
+                if !relationship_edge_matches_agent(&edge, query.agent_id) {
+                    continue;
+                }
+                if !send_ws_relationship_event(
+                    &mut socket,
+                    &WsRelationshipServerEvent::EdgeUpdated { edge },
+                )
+                .await
+                {
+                    break;
+                }
+            }
+            Ok(_) => {}
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                tracing::warn!(
+                    skipped_messages = skipped,
+                    "disconnecting lagging relationship websocket client"
+                );
+                let _ = send_ws_relationship_event(
+                    &mut socket,
+                    &WsRelationshipServerEvent::Error {
+                        message: format!(
+                            "relationship stream lagged by {skipped} events; reconnect for fresh state"
                         ),
                     },
                 )
@@ -1065,6 +1213,27 @@ async fn send_ws_event(socket: &mut WebSocket, event: &WsServerEvent) -> bool {
     }
 }
 
+async fn send_ws_relationship_event(
+    socket: &mut WebSocket,
+    event: &WsRelationshipServerEvent,
+) -> bool {
+    let payload = match serde_json::to_string(event) {
+        Ok(payload) => payload,
+        Err(error) => {
+            tracing::error!(error = %error, "failed to serialize relationship websocket event");
+            return false;
+        }
+    };
+
+    match socket.send(Message::Text(payload.into())).await {
+        Ok(_) => true,
+        Err(error) => {
+            tracing::debug!(error = %error, "relationship websocket send failed");
+            false
+        }
+    }
+}
+
 fn ws_event_matches_agent(event: &WsServerEvent, agent_id: Option<Uuid>) -> bool {
     let Some(agent_id) = agent_id else {
         return true;
@@ -1077,18 +1246,112 @@ fn ws_event_matches_agent(event: &WsServerEvent, agent_id: Option<Uuid>) -> bool
             ..
         } => *event_agent_id == agent_id,
         WsServerEvent::EventAppended { item } => item.agent_id == Some(agent_id),
+        WsServerEvent::RelationshipUpdated { edge } => {
+            edge.agent_a == agent_id || edge.agent_b == agent_id
+        }
     }
 }
 
-fn map_event_record(record: AgentEventRecord) -> EventItemResponse {
+fn relationship_edge_matches_agent(
+    edge: &RelationshipItemResponse,
+    agent_id: Option<Uuid>,
+) -> bool {
+    match agent_id {
+        Some(agent_id) => edge.agent_a == agent_id || edge.agent_b == agent_id,
+        None => true,
+    }
+}
+
+fn map_event_record(record: &AgentEventRecord) -> EventItemResponse {
     EventItemResponse {
         id: record.id,
         agent_id: record.agent_id,
-        event_type: record.event_type,
-        description: record.description,
+        event_type: record.event_type.clone(),
+        description: record.description.clone(),
         payload: record.payload_json.to_string(),
         occurred_at: record.occurred_at.to_rfc3339(),
     }
+}
+
+fn map_relationship_update_event(record: &AgentEventRecord) -> Option<RelationshipItemResponse> {
+    if record.event_type != "agent.relationship.updated" {
+        return None;
+    }
+
+    let payload = record.payload_json.as_object()?;
+    let id = payload.get("relationship_id")?.as_i64()?;
+    let agent_a = Uuid::parse_str(payload.get("agent_a")?.as_str()?).ok()?;
+    let agent_b = Uuid::parse_str(payload.get("agent_b")?.as_str()?).ok()?;
+    let affinity_score = payload.get("affinity_score")?.as_f64()? as f32;
+    let history_summary = payload
+        .get("history_summary")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let last_interaction_at = payload
+        .get("last_interaction_at")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned);
+    let created_at = payload
+        .get("created_at")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| record.occurred_at.to_rfc3339());
+
+    Some(RelationshipItemResponse {
+        id,
+        agent_a,
+        agent_b,
+        affinity_score,
+        history_summary,
+        last_interaction_at,
+        created_at,
+    })
+}
+
+async fn build_relationship_graph(
+    state: &ApiState,
+    agent_id: Option<Uuid>,
+    limit_edges: u32,
+) -> anyhow::Result<RelationshipGraphResponse> {
+    let edges_raw = match agent_id {
+        Some(agent_id) => {
+            state
+                .repository
+                .list_agent_relationships(agent_id, limit_edges)
+                .await?
+        }
+        None => state.repository.list_relationships(limit_edges).await?,
+    };
+
+    let edges: Vec<RelationshipItemResponse> = edges_raw
+        .iter()
+        .cloned()
+        .map(map_relationship_record)
+        .collect();
+
+    let mut participant_ids = HashSet::new();
+    for edge in &edges {
+        participant_ids.insert(edge.agent_a);
+        participant_ids.insert(edge.agent_b);
+    }
+
+    let mut nodes = Vec::with_capacity(participant_ids.len());
+    for participant_id in participant_ids {
+        let agent = state.repository.get_agent(participant_id).await?;
+        let (name, avatar_url) = match agent {
+            Some(agent) => (agent.name, agent.avatar_url),
+            None => (format!("agent-{participant_id}"), None),
+        };
+        nodes.push(RelationshipGraphNodeResponse {
+            agent_id: participant_id,
+            name,
+            avatar_url,
+        });
+    }
+    nodes.sort_by(|left, right| left.name.cmp(&right.name));
+
+    Ok(RelationshipGraphResponse { nodes, edges })
 }
 
 fn map_recall_item(item: MemoryRecallItem) -> RecallItemResponse {
