@@ -28,8 +28,8 @@ Backend для симуляции мира автономных AI-агенто�
 | 6. Граф отношений | `FULLY IMPLEMENTED` | Есть graph snapshot API (`/relationships/graph`) и live stream (`/ws/relationships`); worker публикует `agent.relationship.updated` события |
 | 7. Inspector агента | `FULLY IMPLEMENTED` | Есть агрегирующий endpoint `/agents/{id}/inspector` (agent profile + state + recent events/messages/relationships/memories + optional recall) |
 | 8. Панель вмешательства | `FULLY IMPLEMENTED` | Реализованы `POST/GET /interventions` с action-типами (`trigger_tick`, `append_memory`, `send_message`, `append_event`) и audit-log в таблице `interventions` |
-| Доп. фича 1: настроение влияет на стиль речи | `PARTIAL` | Mood передается в prompt, но полноценные style policies не оформлены |
-| Доп. фича 2: страница агента с историей отношений | `PARTIAL` | Backend API для отношений есть; нужен frontend-экран и timeline-агрегации |
+| Доп. фича 1: настроение влияет на стиль речи | `FULLY IMPLEMENTED` | Введены формализованные mood-based speech style policies (tone/cadence/diction/punctuation), они инжектятся в LLM prompts, применяются в deterministic fallback и сохраняются в `events.payload_json.speech_style` |
+| Доп. фича 2: страница агента с историей отношений | `FULLY IMPLEMENTED` | Добавлен агрегированный relationship timeline API (`/agents/{id}/relationships/history`) и расширен inspector (`relationship_timeline`), что закрывает backend-контракт для страницы истории отношений |
 
 ---
 
@@ -103,6 +103,7 @@ flowchart LR
   - выполнение agent tick;
   - dedup/busy protection на процесс;
   - staged decision pipeline: reflection -> goal -> action_plan -> execution;
+  - mood-based speech style policy layer для текста стадий и execution summary;
   - запись `agent_states` и `events`;
   - LLM-driven stage outputs с per-stage fallback.
 
@@ -123,6 +124,7 @@ flowchart LR
 ### Emotions
 - Текущее состояние:
   - `valence/arousal/mood_label` обновляются на каждом тике через emotional model (action summary + personality bias);
+  - mood напрямую задает speech style profile (tone/cadence/diction/punctuation) для generation/fallback;
   - отдельный worker выполняет периодический mood decay к нейтральному состоянию.
 
 ### Interventions
@@ -265,9 +267,10 @@ CR_project/
 
 ### 7.7 Inspector flow
 1. Клиент вызывает `GET /agents/{id}/inspector`.
-2. API параллельно читает: profile/state/events/messages/relationships/memories.
-3. При наличии `recall_query` API дополнительно запускает vector recall и включает блок релевантных memories.
-4. Dashboard получает готовый агрегированный срез для страницы агента одним запросом.
+2. API параллельно читает: profile/state/events/messages/relationships/memory и message-based relationship timeline.
+3. В ответе возвращаются блоки `recent_relationships` и `relationship_timeline` (история взаимодействий с контрагентами + snapshot текущей связи).
+4. При наличии `recall_query` API дополнительно запускает vector recall и включает блок релевантных memories.
+5. Dashboard получает готовый агрегированный срез для страницы агента одним запросом.
 
 ### 7.8 Intervention flow
 1. Клиент панели вызывает `POST /interventions` с `admin_user_id` и `action`.
@@ -356,7 +359,7 @@ Response (`200`):
 
 ### 8.3.1 Agent Inspector Profile
 
-#### `GET /agents/{id}/inspector?events_limit=<1..200>&messages_limit=<1..200>&relationships_limit=<1..200>&memories_limit=<1..200>&recall_query=...&recall_top_k=<1..50>`
+#### `GET /agents/{id}/inspector?events_limit=<1..200>&messages_limit=<1..200>&relationships_limit=<1..200>&timeline_limit=<1..200>&memories_limit=<1..200>&recall_query=...&recall_top_k=<1..50>`
 
 Response:
 ```json
@@ -379,11 +382,13 @@ Response:
     "events_count": 20,
     "messages_count": 10,
     "relationships_count": 5,
+    "timeline_count": 20,
     "memories_count": 20
   },
   "recent_events": [...],
   "recent_messages": [...],
   "recent_relationships": [...],
+  "relationship_timeline": [...],
   "recent_memories": [...],
   "recall": {
     "query": "recent conflict",
@@ -535,6 +540,38 @@ Response:
       "history_summary": "Let's cooperate on exploring the market.",
       "last_interaction_at": "2026-02-16T12:00:01Z",
       "created_at": "2026-02-16T12:00:01Z"
+    }
+  ]
+}
+```
+
+### 8.7.1 Agent relationship history timeline
+
+#### `GET /agents/{id}/relationships/history?limit=<1..200>`
+
+Response:
+```json
+{
+  "agent_id": "uuid-a",
+  "items": [
+    {
+      "message_id": 77,
+      "direction": "outgoing",
+      "counterpart_agent_id": "uuid-b",
+      "counterpart_name": "Bob",
+      "counterpart_avatar_url": null,
+      "content": "Let's cooperate on exploring the market.",
+      "status": "delivered",
+      "created_at": "2026-02-16T12:00:00Z",
+      "relationship": {
+        "id": 5,
+        "agent_a": "uuid-a",
+        "agent_b": "uuid-b",
+        "affinity_score": 0.32,
+        "history_summary": "Let's cooperate on exploring the market.",
+        "last_interaction_at": "2026-02-16T12:00:01Z",
+        "created_at": "2026-02-16T12:00:01Z"
+      }
     }
   ]
 }
@@ -840,6 +877,7 @@ Payload в point:
 | `GEMINI_TIMEOUT_MS` | `15000` |
 | `GEMINI_MAX_RETRIES` | `2` |
 | `GEMINI_RETRY_BACKOFF_MS` | `300` |
+| `GEMINI_MIN_REQUEST_INTERVAL_MS` | `1000` |
 
 ### 10.5 Qdrant
 
@@ -942,11 +980,15 @@ set WORKER_MOOD_DECAY_STEP=0.06
 set WORKER_MESSAGE_INTERVAL_MS=1000
 set WORKER_MESSAGE_BATCH_SIZE=32
 set GEMINI_API_KEY=<your_google_api_key>
+set GEMINI_MIN_REQUEST_INTERVAL_MS=1000
 ```
 
 Если `GEMINI_API_KEY` не задан, система работает в fallback-режиме:
 - tick summaries deterministic;
 - embeddings через local hash embedder.
+
+`GEMINI_MIN_REQUEST_INTERVAL_MS` задает минимальный интервал между Gemini запросами
+в рамках одного процесса (API или worker). Установите `0`, чтобы отключить throttling.
 
 ### 11.4 Запуск сервисов
 
@@ -1052,7 +1094,7 @@ VALUES
 1. Базовый runtime и graceful shutdown.
 2. Structured logging.
 3. Конфигурирование через env с валидацией.
-4. Agent tick orchestrator со staged decision pipeline (reflection -> goal -> action_plan -> execution).
+4. Agent tick orchestrator со staged decision pipeline (reflection -> goal -> action_plan -> execution) и mood-based speech style policies.
 5. Постгрес-репозиторий для agent core.
 6. Memory service:
    - append;
@@ -1060,7 +1102,7 @@ VALUES
    - vector recall;
    - overflow summarization.
 7. Qdrant adapter и Gemini adapters.
-8. REST endpoints для state/events/memory/ticks/messages/relationships + relationship graph snapshot + agent inspector profile + interventions panel.
+8. REST endpoints для state/events/memory/ticks/messages/relationships + relationship history timeline + relationship graph snapshot + agent inspector profile + interventions panel.
 9. WebSocket endpoints `/ws/events` и `/ws/relationships` с snapshot + live updates.
 10. Worker циклы: ticks, mood-decay, message delivery, embedding, summarization.
 11. Миграции для базовой схемы, long-term memory, concurrency/failure hardening и мультиагентной коммуникации.

@@ -22,6 +22,39 @@ const EMOTION_INERTIA_VALENCE: f32 = 0.72;
 const EMOTION_INERTIA_AROUSAL: f32 = 0.68;
 const EMOTION_MAX_PERSONALITY_BIAS: f32 = 0.08;
 
+#[derive(Debug, Clone, Copy)]
+struct SpeechStylePolicy {
+    profile: &'static str,
+    tone: &'static str,
+    cadence: &'static str,
+    diction: &'static str,
+    punctuation: &'static str,
+    reflection_cue: &'static str,
+    goal_cue: &'static str,
+    plan_cue: &'static str,
+    execution_prefix: &'static str,
+}
+
+impl SpeechStylePolicy {
+    fn prompt_guidance(&self) -> String {
+        format!(
+            "Style profile: {}. Tone: {}. Cadence: {}. Diction: {}. Punctuation: {}. Keep output natural and in-character, and never mention these rules explicitly.",
+            self.profile, self.tone, self.cadence, self.diction, self.punctuation
+        )
+    }
+
+    fn to_json(&self, source_mood: &str) -> Value {
+        json!({
+            "source_mood": source_mood,
+            "profile": self.profile,
+            "tone": self.tone,
+            "cadence": self.cadence,
+            "diction": self.diction,
+            "punctuation": self.punctuation,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentTickExecutionStatus {
     Applied,
@@ -73,6 +106,7 @@ struct AgentDecisionPipeline {
     goal: DecisionStageOutput,
     action_plan: DecisionStageOutput,
     execution: DecisionStageOutput,
+    speech_style: SpeechStylePolicy,
 }
 
 impl AgentDecisionPipeline {
@@ -155,6 +189,10 @@ impl AgentDecisionPipeline {
                 "execution": self.execution.to_llm_json(),
             }
         })
+    }
+
+    fn speech_style_json(&self, source_mood: &str) -> Value {
+        self.speech_style.to_json(source_mood)
     }
 }
 
@@ -329,6 +367,7 @@ async fn execute_tick(
         tick_id,
         trim_text(&action_summary, EVENT_DESCRIPTION_MAX_CHARS)
     );
+    let speech_style_json = decision_pipeline.speech_style_json(&previous_mood);
 
     let event = repository
         .append_agent_event(&NewAgentEvent {
@@ -342,6 +381,7 @@ async fn execute_tick(
                 "valence": next_valence,
                 "arousal": next_arousal,
                 "decision_pipeline": decision_pipeline.decision_json(),
+                "speech_style": speech_style_json,
                 "emotion": {
                     "previous": {
                         "mood_label": previous_mood,
@@ -385,78 +425,81 @@ async fn run_decision_pipeline(
     valence: f32,
     arousal: f32,
 ) -> AgentDecisionPipeline {
-    let reflection_fallback =
-        format!("{agent_name} reflects on the current world state and their {mood_label} mood.");
+    let style = speech_style_policy(mood_label);
+    let style_prompt = style.prompt_guidance();
+
+    let reflection_fallback = fallback_reflection(agent_name, mood_label, style);
     let reflection = generate_pipeline_stage(
         llm,
         "reflection",
         Some(format!(
-            "You are the reflection stage of autonomous agent `{agent_name}`. Personality JSON: {personality_json}. Return one concise sentence."
+            "You are the reflection stage of autonomous agent `{agent_name}`. Personality JSON: {personality_json}. Return one concise sentence.\n{style_prompt}"
         )),
         format!(
-            "Tick {tick_id}. Mood: {mood_label}. Valence: {valence:.2}. Arousal: {arousal:.2}. Write a brief self-reflection."
+            "Tick {tick_id}. Mood: {mood_label}. Valence: {valence:.2}. Arousal: {arousal:.2}. Write a brief self-reflection using style profile `{}`.",
+            style.profile
         ),
         reflection_fallback,
         PIPELINE_STAGE_MAX_CHARS,
     )
     .await;
 
-    let goal_fallback =
-        format!("{agent_name} sets a short-term goal to improve social stability and progress.");
+    let goal_fallback = fallback_goal(agent_name, style);
     let goal = generate_pipeline_stage(
         llm,
         "goal_selection",
         Some(format!(
-            "You are the goal-selection stage for agent `{agent_name}`. Return one concrete goal sentence."
+            "You are the goal-selection stage for agent `{agent_name}`. Return one concrete goal sentence.\n{style_prompt}"
         )),
         format!(
-            "Tick {tick_id}. Reflection: {}. Mood: {mood_label}. Choose one immediate goal.",
-            reflection.text
+            "Tick {tick_id}. Reflection: {}. Mood: {mood_label}. Choose one immediate goal using style profile `{}`.",
+            reflection.text, style.profile
         ),
         goal_fallback,
         PIPELINE_STAGE_MAX_CHARS,
     )
     .await;
 
-    let action_plan_fallback = format!(
-        "{agent_name} plans a concrete action: contact a nearby agent, exchange context, and adapt."
-    );
+    let action_plan_fallback = fallback_action_plan(agent_name, style);
     let action_plan = generate_pipeline_stage(
         llm,
         "action_planning",
         Some(format!(
-            "You are the action-planning stage for agent `{agent_name}`. Return one concrete immediate plan."
+            "You are the action-planning stage for agent `{agent_name}`. Return one concrete immediate plan.\n{style_prompt}"
         )),
         format!(
-            "Tick {tick_id}. Reflection: {}. Goal: {}. Produce an immediate action plan.",
-            reflection.text, goal.text
+            "Tick {tick_id}. Reflection: {}. Goal: {}. Produce an immediate action plan using style profile `{}`.",
+            reflection.text, goal.text, style.profile
         ),
         action_plan_fallback,
         PIPELINE_STAGE_MAX_CHARS,
     )
     .await;
 
-    let execution_fallback = fallback_execution_summary(agent_name, mood_label, &action_plan.text);
-    let execution = generate_pipeline_stage(
+    let execution_fallback =
+        fallback_execution_summary(agent_name, mood_label, &action_plan.text, style);
+    let mut execution = generate_pipeline_stage(
         llm,
         "execution",
         Some(format!(
-            "You are the execution stage for agent `{agent_name}`. Simulate execution result in 1-2 short sentences."
+            "You are the execution stage for agent `{agent_name}`. Simulate execution result in 1-2 short sentences.\n{style_prompt}"
         )),
         format!(
-            "Tick {tick_id}. Goal: {}. Plan: {}. Mood: {mood_label}. Return execution result and immediate side-effect.",
-            goal.text, action_plan.text
+            "Tick {tick_id}. Goal: {}. Plan: {}. Mood: {mood_label}. Return execution result and immediate side-effect using style profile `{}`.",
+            goal.text, action_plan.text, style.profile
         ),
         execution_fallback,
         LLM_SUMMARY_MAX_CHARS,
     )
     .await;
+    execution.text = style_execution_summary(&execution.text, style);
 
     AgentDecisionPipeline {
         reflection,
         goal,
         action_plan,
         execution,
+        speech_style: style,
     }
 }
 
@@ -513,11 +556,150 @@ async fn generate_pipeline_stage(
     }
 }
 
-fn fallback_execution_summary(agent_name: &str, mood_label: &str, action_plan: &str) -> String {
+fn fallback_execution_summary(
+    agent_name: &str,
+    mood_label: &str,
+    action_plan: &str,
+    style: SpeechStylePolicy,
+) -> String {
     format!(
-        "{agent_name} ({mood_label}) executes plan: {}",
+        "{} {agent_name} ({mood_label}) executes plan: {}",
+        style.execution_prefix,
         trim_text(action_plan, EVENT_DESCRIPTION_MAX_CHARS)
     )
+}
+
+fn fallback_reflection(agent_name: &str, mood_label: &str, style: SpeechStylePolicy) -> String {
+    format!(
+        "{agent_name} reflects in a {} voice, noting their {mood_label} state and immediate priorities.",
+        style.reflection_cue
+    )
+}
+
+fn fallback_goal(agent_name: &str, style: SpeechStylePolicy) -> String {
+    format!(
+        "{agent_name} states a {} goal: stabilize nearby interactions and keep forward momentum.",
+        style.goal_cue
+    )
+}
+
+fn fallback_action_plan(agent_name: &str, style: SpeechStylePolicy) -> String {
+    format!(
+        "{agent_name} outlines a {} plan: contact a nearby agent, exchange context, and adapt.",
+        style.plan_cue
+    )
+}
+
+fn style_execution_summary(text: &str, style: SpeechStylePolicy) -> String {
+    let trimmed = trim_text(text, LLM_SUMMARY_MAX_CHARS);
+    if trimmed.is_empty() {
+        return style.execution_prefix.to_owned();
+    }
+
+    let already_prefixed = trimmed
+        .to_lowercase()
+        .starts_with(&style.execution_prefix.to_lowercase());
+    if already_prefixed {
+        return trimmed;
+    }
+
+    trim_text(
+        &format!("{} {}", style.execution_prefix, trimmed),
+        LLM_SUMMARY_MAX_CHARS,
+    )
+}
+
+fn speech_style_policy(mood_label: &str) -> SpeechStylePolicy {
+    match mood_label {
+        "excited" => SpeechStylePolicy {
+            profile: "excited",
+            tone: "energetic and upbeat",
+            cadence: "fast with short bursts",
+            diction: "action-first and vivid",
+            punctuation: "allows occasional exclamation",
+            reflection_cue: "energetic and upbeat",
+            goal_cue: "bold and momentum-driven",
+            plan_cue: "fast and initiative-heavy",
+            execution_prefix: "With energetic urgency,",
+        },
+        "content" => SpeechStylePolicy {
+            profile: "content",
+            tone: "warm and confident",
+            cadence: "smooth and even",
+            diction: "clear and positive",
+            punctuation: "soft, minimal emphasis",
+            reflection_cue: "warm and confident",
+            goal_cue: "collaborative and upbeat",
+            plan_cue: "assured and smooth",
+            execution_prefix: "With warm confidence,",
+        },
+        "calm" => SpeechStylePolicy {
+            profile: "calm",
+            tone: "measured and composed",
+            cadence: "steady and deliberate",
+            diction: "precise and sparse",
+            punctuation: "minimal and clean",
+            reflection_cue: "measured and composed",
+            goal_cue: "stable and deliberate",
+            plan_cue: "orderly and methodical",
+            execution_prefix: "In a measured tone,",
+        },
+        "angry" => SpeechStylePolicy {
+            profile: "angry",
+            tone: "sharp and clipped",
+            cadence: "abrupt, short sentences",
+            diction: "hard-edged and direct",
+            punctuation: "firm stops, no flourish",
+            reflection_cue: "sharp and clipped",
+            goal_cue: "hard-edged and assertive",
+            plan_cue: "forceful and boundary-setting",
+            execution_prefix: "With a sharp edge,",
+        },
+        "sad" => SpeechStylePolicy {
+            profile: "sad",
+            tone: "muted and restrained",
+            cadence: "slow, compressed phrasing",
+            diction: "low-energy and careful",
+            punctuation: "soft endings",
+            reflection_cue: "muted and restrained",
+            goal_cue: "cautious and low-energy",
+            plan_cue: "minimal and careful",
+            execution_prefix: "With a muted voice,",
+        },
+        "anxious" => SpeechStylePolicy {
+            profile: "anxious",
+            tone: "hesitant and tense",
+            cadence: "fragmented but purposeful",
+            diction: "guarded and vigilant",
+            punctuation: "brief stops with occasional breaks",
+            reflection_cue: "hesitant and tense",
+            goal_cue: "risk-averse and vigilant",
+            plan_cue: "defensive and contingency-focused",
+            execution_prefix: "With hesitant tension,",
+        },
+        "tired" => SpeechStylePolicy {
+            profile: "tired",
+            tone: "flat and brief",
+            cadence: "short, low-effort phrasing",
+            diction: "minimal and literal",
+            punctuation: "plain endings only",
+            reflection_cue: "flat and brief",
+            goal_cue: "minimal-effort and essential",
+            plan_cue: "short and conservative",
+            execution_prefix: "With flat brevity,",
+        },
+        _ => SpeechStylePolicy {
+            profile: "neutral",
+            tone: "direct and factual",
+            cadence: "balanced and plain",
+            diction: "clear and literal",
+            punctuation: "simple declarative punctuation",
+            reflection_cue: "direct and factual",
+            goal_cue: "clear and practical",
+            plan_cue: "stepwise and plain",
+            execution_prefix: "In a direct tone,",
+        },
+    }
 }
 
 fn evolve_emotional_state(
@@ -716,6 +898,7 @@ mod tests {
     struct StubLlm {
         mode: StubLlmMode,
         calls: Arc<AtomicUsize>,
+        captured_requests: Option<Arc<Mutex<Vec<LlmGenerateRequest>>>>,
     }
 
     impl StubLlm {
@@ -723,6 +906,7 @@ mod tests {
             Self {
                 mode: StubLlmMode::Success(summary.to_owned()),
                 calls,
+                captured_requests: None,
             }
         }
 
@@ -730,14 +914,30 @@ mod tests {
             Self {
                 mode: StubLlmMode::Fail(message.to_owned()),
                 calls,
+                captured_requests: None,
+            }
+        }
+
+        fn success_with_capture(
+            summary: &str,
+            calls: Arc<AtomicUsize>,
+            captured_requests: Arc<Mutex<Vec<LlmGenerateRequest>>>,
+        ) -> Self {
+            Self {
+                mode: StubLlmMode::Success(summary.to_owned()),
+                calls,
+                captured_requests: Some(captured_requests),
             }
         }
     }
 
     #[async_trait]
     impl LlmPort for StubLlm {
-        async fn generate(&self, _request: LlmGenerateRequest) -> Result<LlmGenerateResponse> {
+        async fn generate(&self, request: LlmGenerateRequest) -> Result<LlmGenerateResponse> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(captured) = &self.captured_requests {
+                captured.lock().await.push(request.clone());
+            }
             match &self.mode {
                 StubLlmMode::Success(summary) => Ok(LlmGenerateResponse {
                     text: summary.clone(),
@@ -903,6 +1103,14 @@ mod tests {
         async fn list_agent_messages(
             &self,
             _receiver_agent_id: Uuid,
+            _limit: u32,
+        ) -> Result<Vec<MessageRecord>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_agent_message_timeline(
+            &self,
+            _agent_id: Uuid,
             _limit: u32,
         ) -> Result<Vec<MessageRecord>> {
             Ok(Vec::new())
@@ -1102,9 +1310,10 @@ mod tests {
         );
         assert_eq!(
             event.payload_json["action_summary"],
-            "Plans a cooperative conversation."
+            "In a direct tone, Plans a cooperative conversation."
         );
         assert!(event.payload_json["valence"].as_f64().unwrap_or_default() > 0.0);
+        assert_eq!(event.payload_json["speech_style"]["profile"], "neutral");
     }
 
     #[tokio::test]
@@ -1142,6 +1351,91 @@ mod tests {
                 .unwrap_or_default()
                 .contains("Mia")
         );
+        assert_eq!(event.payload_json["speech_style"]["profile"], "neutral");
+    }
+
+    #[tokio::test]
+    async fn applies_style_profile_to_execution_summary_without_llm() {
+        let repository = Arc::new(InMemoryAgentCoreRepository::default());
+        let agent_id = Uuid::new_v4();
+        seed_agent(repository.as_ref(), agent_id, "Tara").await;
+        {
+            let mut states = repository.states.lock().await;
+            states.insert(
+                agent_id,
+                AgentStateRecord {
+                    agent_id,
+                    valence: 0.0,
+                    arousal: -0.6,
+                    mood_label: "tired".to_owned(),
+                    updated_at: Utc::now(),
+                },
+            );
+        }
+
+        let orchestrator = AgentTickOrchestrator::new(repository.clone());
+        let outcome = orchestrator
+            .run_agent_tick(agent_id, Some("tick-style-tired".to_owned()))
+            .await
+            .expect("tick should execute");
+
+        let AgentTickOrchestratorOutcome::Executed(result) = outcome else {
+            panic!("expected executed outcome");
+        };
+
+        assert!(
+            result.action_summary.starts_with("With flat brevity,"),
+            "execution summary should use tired speech style"
+        );
+
+        let events = repository.events.lock().await;
+        let event = events.last().expect("event should exist");
+        assert_eq!(event.payload_json["speech_style"]["profile"], "tired");
+    }
+
+    #[tokio::test]
+    async fn injects_style_policy_into_llm_stage_prompts() {
+        let repository = Arc::new(InMemoryAgentCoreRepository::default());
+        let agent_id = Uuid::new_v4();
+        seed_agent(repository.as_ref(), agent_id, "Rae").await;
+        {
+            let mut states = repository.states.lock().await;
+            states.insert(
+                agent_id,
+                AgentStateRecord {
+                    agent_id,
+                    valence: -0.8,
+                    arousal: 0.7,
+                    mood_label: "angry".to_owned(),
+                    updated_at: Utc::now(),
+                },
+            );
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let captured = Arc::new(Mutex::new(Vec::<LlmGenerateRequest>::new()));
+        let llm: Arc<dyn LlmPort> = Arc::new(StubLlm::success_with_capture(
+            "keeps a hard line.",
+            Arc::clone(&calls),
+            Arc::clone(&captured),
+        ));
+
+        let orchestrator = AgentTickOrchestrator::new(repository).with_optional_llm(Some(llm));
+        let _ = orchestrator
+            .run_agent_tick(agent_id, Some("tick-style-angry".to_owned()))
+            .await
+            .expect("tick should execute");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        let prompts = captured.lock().await;
+        assert_eq!(prompts.len(), 4);
+        assert!(prompts.iter().all(|request| {
+            request
+                .system_prompt
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Style profile: angry")
+        }));
     }
 
     #[tokio::test]

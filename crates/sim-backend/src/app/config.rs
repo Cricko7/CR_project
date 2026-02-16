@@ -30,6 +30,7 @@ const DEFAULT_GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com
 const DEFAULT_GEMINI_TIMEOUT_MS: u64 = 15_000;
 const DEFAULT_GEMINI_MAX_RETRIES: u32 = 2;
 const DEFAULT_GEMINI_RETRY_BACKOFF_MS: u64 = 300;
+const DEFAULT_GEMINI_MIN_REQUEST_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_GEMINI_EMBED_MODEL: &str = "text-embedding-004";
 const DEFAULT_QDRANT_URL: &str = "http://localhost:6333";
 const DEFAULT_QDRANT_COLLECTION: &str = "agent_memories";
@@ -68,6 +69,7 @@ pub struct GeminiConfig {
     pub timeout: Duration,
     pub max_retries: u32,
     pub retry_backoff: Duration,
+    pub min_request_interval: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -374,6 +376,10 @@ fn load_gemini_config() -> Result<Option<GeminiConfig>, ConfigError> {
     let max_retries: u32 = parse_env("GEMINI_MAX_RETRIES", DEFAULT_GEMINI_MAX_RETRIES)?;
     let retry_backoff_ms: u64 =
         parse_env("GEMINI_RETRY_BACKOFF_MS", DEFAULT_GEMINI_RETRY_BACKOFF_MS)?;
+    let min_request_interval_ms: u64 = parse_env(
+        "GEMINI_MIN_REQUEST_INTERVAL_MS",
+        DEFAULT_GEMINI_MIN_REQUEST_INTERVAL_MS,
+    )?;
 
     if model.trim().is_empty() {
         return Err(ConfigError::invalid("GEMINI_MODEL", "must not be empty"));
@@ -408,6 +414,7 @@ fn load_gemini_config() -> Result<Option<GeminiConfig>, ConfigError> {
         timeout: Duration::from_millis(timeout_ms),
         max_retries,
         retry_backoff: Duration::from_millis(retry_backoff_ms),
+        min_request_interval: Duration::from_millis(min_request_interval_ms),
     }))
 }
 

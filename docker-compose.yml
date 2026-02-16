@@ -48,6 +48,7 @@ services:
       MEMORY_SUMMARY_INTERVAL_MS: "30000"
       API_EVENT_BRIDGE_INTERVAL_MS: "500"
       API_EVENT_BRIDGE_BATCH_SIZE: "128"
+      GEMINI_MIN_REQUEST_INTERVAL_MS: "1000"
       # GEMINI_API_KEY: "<optional>"
       # GEMINI_MODEL: "gemini-2.0-flash"
     ports:
@@ -100,6 +101,7 @@ services:
       MEMORY_SUMMARY_BATCH_SIZE: "20"
       MEMORY_EMBED_INTERVAL_MS: "5000"
       MEMORY_SUMMARY_INTERVAL_MS: "30000"
+      GEMINI_MIN_REQUEST_INTERVAL_MS: "1000"
       # GEMINI_API_KEY: "<optional>"
       # GEMINI_MODEL: "gemini-2.0-flash"
     depends_on:

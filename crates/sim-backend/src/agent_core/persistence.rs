@@ -136,6 +136,11 @@ pub trait AgentCoreRepository: Send + Sync {
         receiver_agent_id: Uuid,
         limit: u32,
     ) -> Result<Vec<MessageRecord>>;
+    async fn list_agent_message_timeline(
+        &self,
+        agent_id: Uuid,
+        limit: u32,
+    ) -> Result<Vec<MessageRecord>>;
     async fn upsert_relationship_interaction(
         &self,
         left_agent_id: Uuid,

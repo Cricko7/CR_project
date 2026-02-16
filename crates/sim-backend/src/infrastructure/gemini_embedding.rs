@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use reqwest::Client;
@@ -5,6 +7,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::app::config::GeminiConfig;
+use crate::infrastructure::gemini_rate_limiter::{GeminiRateLimiter, shared_gemini_rate_limiter};
 use crate::memory::TextEmbedder;
 
 const DEFAULT_EMBED_MODEL: &str = "text-embedding-004";
@@ -14,6 +17,7 @@ pub struct GeminiEmbeddingClient {
     config: GeminiConfig,
     http: Client,
     embedding_model: String,
+    rate_limiter: Arc<GeminiRateLimiter>,
 }
 
 impl GeminiEmbeddingClient {
@@ -28,11 +32,13 @@ impl GeminiEmbeddingClient {
         } else {
             config.embedding_model.clone()
         };
+        let rate_limiter = shared_gemini_rate_limiter(config.min_request_interval);
 
         Ok(Self {
             config,
             http,
             embedding_model,
+            rate_limiter,
         })
     }
 
@@ -52,6 +58,7 @@ impl GeminiEmbeddingClient {
             "taskType": task_type
         });
 
+        self.rate_limiter.wait_turn().await;
         let response = self
             .http
             .post(self.endpoint())

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -119,6 +119,7 @@ struct AgentInspectorQuery {
     messages_limit: Option<u32>,
     relationships_limit: Option<u32>,
     memories_limit: Option<u32>,
+    timeline_limit: Option<u32>,
     recall_query: Option<String>,
     recall_top_k: Option<u32>,
 }
@@ -130,6 +131,7 @@ struct AgentInspectorResponse {
     recent_events: Vec<EventItemResponse>,
     recent_messages: Vec<MessageItemResponse>,
     recent_relationships: Vec<RelationshipItemResponse>,
+    relationship_timeline: Vec<RelationshipTimelineItemResponse>,
     recent_memories: Vec<InspectorMemoryItemResponse>,
     recall: Option<AgentInspectorRecallResponse>,
     summary: AgentInspectorSummaryResponse,
@@ -167,6 +169,7 @@ struct AgentInspectorSummaryResponse {
     events_count: usize,
     messages_count: usize,
     relationships_count: usize,
+    timeline_count: usize,
     memories_count: usize,
 }
 
@@ -435,6 +438,11 @@ struct RelationshipListQuery {
 }
 
 #[derive(Deserialize)]
+struct RelationshipTimelineQuery {
+    limit: Option<u32>,
+}
+
+#[derive(Deserialize)]
 struct RelationshipGraphQuery {
     agent_id: Option<Uuid>,
     limit_edges: Option<u32>,
@@ -443,6 +451,12 @@ struct RelationshipGraphQuery {
 #[derive(Serialize)]
 struct AgentRelationshipsResponse {
     items: Vec<RelationshipItemResponse>,
+}
+
+#[derive(Serialize)]
+struct AgentRelationshipTimelineResponse {
+    agent_id: Uuid,
+    items: Vec<RelationshipTimelineItemResponse>,
 }
 
 #[derive(Serialize, Clone)]
@@ -454,6 +468,19 @@ struct RelationshipItemResponse {
     history_summary: String,
     last_interaction_at: Option<String>,
     created_at: String,
+}
+
+#[derive(Serialize, Clone)]
+struct RelationshipTimelineItemResponse {
+    message_id: i64,
+    direction: String,
+    counterpart_agent_id: Option<Uuid>,
+    counterpart_name: Option<String>,
+    counterpart_avatar_url: Option<String>,
+    content: String,
+    status: String,
+    created_at: String,
+    relationship: Option<RelationshipItemResponse>,
 }
 
 #[derive(Serialize, Clone)]
@@ -609,6 +636,10 @@ async fn main() -> anyhow::Result<()> {
             post(send_agent_message).get(list_agent_messages),
         )
         .route("/agents/{id}/relationships", get(list_agent_relationships))
+        .route(
+            "/agents/{id}/relationships/history",
+            get(list_agent_relationship_history),
+        )
         .route(
             "/agents/{id}/memories/summarize",
             post(summarize_agent_memory),
@@ -889,6 +920,10 @@ async fn get_agent_inspector(
         .memories_limit
         .unwrap_or(DEFAULT_INSPECTOR_LIMIT)
         .clamp(1, 200);
+    let timeline_limit = query
+        .timeline_limit
+        .unwrap_or(DEFAULT_INSPECTOR_LIMIT)
+        .clamp(1, 200);
     let recall_query = query
         .recall_query
         .map(|value| value.trim().to_owned())
@@ -907,6 +942,7 @@ async fn get_agent_inspector(
         events_result,
         messages_result,
         relationships_result,
+        timeline_messages_result,
         memories_result,
     ) = tokio::join!(
         repository.get_agent(agent_id),
@@ -914,6 +950,7 @@ async fn get_agent_inspector(
         repository.list_agent_events(Some(agent_id), events_limit),
         repository.list_agent_messages(agent_id, messages_limit),
         repository.list_agent_relationships(agent_id, relationships_limit),
+        repository.list_agent_message_timeline(agent_id, timeline_limit),
         memory_service.list_recent_memories(agent_id, memories_limit),
     );
 
@@ -972,6 +1009,12 @@ async fn get_agent_inspector(
             format!("failed to read agent memories: {error}"),
         )
     })?;
+    let timeline_messages = timeline_messages_result.map_err(|error| {
+        internal_error(
+            "inspector_read_failed",
+            format!("failed to read agent relationship timeline: {error}"),
+        )
+    })?;
 
     let recall = if let Some(recall_query) = recall_query {
         let recalled = state
@@ -1000,6 +1043,9 @@ async fn get_agent_inspector(
         .into_iter()
         .map(map_relationship_record)
         .collect();
+    let relationship_timeline =
+        build_relationship_timeline(&state, agent_id, timeline_messages, &recent_relationships)
+            .await?;
     let recent_memories: Vec<InspectorMemoryItemResponse> =
         memories.into_iter().map(map_inspector_memory).collect();
 
@@ -1016,11 +1062,13 @@ async fn get_agent_inspector(
             events_count: recent_events.len(),
             messages_count: recent_messages.len(),
             relationships_count: recent_relationships.len(),
+            timeline_count: relationship_timeline.len(),
             memories_count: recent_memories.len(),
         },
         recent_events,
         recent_messages,
         recent_relationships,
+        relationship_timeline,
         recent_memories,
         recall,
     }))
@@ -1273,6 +1321,42 @@ async fn list_agent_relationships(
         .collect();
 
     Ok(Json(AgentRelationshipsResponse { items }))
+}
+
+async fn list_agent_relationship_history(
+    State(state): State<ApiState>,
+    Path(agent_id): Path<Uuid>,
+    Query(query): Query<RelationshipTimelineQuery>,
+) -> Result<Json<AgentRelationshipTimelineResponse>, (StatusCode, Json<ApiErrorResponse>)> {
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let messages = state
+        .repository
+        .list_agent_message_timeline(agent_id, limit)
+        .await
+        .map_err(|error| {
+            internal_error(
+                "relationship_history_failed",
+                format!("failed to read relationship message timeline: {error}"),
+            )
+        })?;
+    let relationships = state
+        .repository
+        .list_agent_relationships(agent_id, limit.clamp(1, 200))
+        .await
+        .map_err(|error| {
+            internal_error(
+                "relationship_history_failed",
+                format!("failed to read relationship snapshots: {error}"),
+            )
+        })?;
+    let relationship_items: Vec<RelationshipItemResponse> = relationships
+        .into_iter()
+        .map(map_relationship_record)
+        .collect();
+
+    let items =
+        build_relationship_timeline(&state, agent_id, messages, &relationship_items).await?;
+    Ok(Json(AgentRelationshipTimelineResponse { agent_id, items }))
 }
 
 async fn get_relationship_graph(
@@ -1957,6 +2041,99 @@ fn relationship_edge_matches_agent(
         Some(agent_id) => edge.agent_a == agent_id || edge.agent_b == agent_id,
         None => true,
     }
+}
+
+async fn build_relationship_timeline(
+    state: &ApiState,
+    agent_id: Uuid,
+    messages: Vec<MessageRecord>,
+    relationships: &[RelationshipItemResponse],
+) -> Result<Vec<RelationshipTimelineItemResponse>, (StatusCode, Json<ApiErrorResponse>)> {
+    let mut relationship_by_counterpart: HashMap<Uuid, RelationshipItemResponse> = HashMap::new();
+    for edge in relationships {
+        if let Some(counterpart_id) = relationship_counterpart_agent_id(edge, agent_id) {
+            relationship_by_counterpart.insert(counterpart_id, edge.clone());
+        }
+    }
+
+    let mut counterpart_ids = HashSet::new();
+    for message in &messages {
+        if let Some(counterpart_id) = timeline_counterpart_agent_id(message, agent_id) {
+            counterpart_ids.insert(counterpart_id);
+        }
+    }
+
+    let mut counterparts: HashMap<Uuid, (String, Option<String>)> = HashMap::new();
+    for counterpart_id in counterpart_ids {
+        let record = state
+            .repository
+            .get_agent(counterpart_id)
+            .await
+            .map_err(|error| {
+                internal_error(
+                    "relationship_history_failed",
+                    format!("failed to load counterpart agent profile: {error}"),
+                )
+            })?;
+        let (name, avatar_url) = match record {
+            Some(agent) => (agent.name, agent.avatar_url),
+            None => (format!("agent-{counterpart_id}"), None),
+        };
+        counterparts.insert(counterpart_id, (name, avatar_url));
+    }
+
+    let mut items = Vec::with_capacity(messages.len());
+    for message in messages {
+        let direction = if message.sender_id == Some(agent_id) {
+            "outgoing"
+        } else {
+            "incoming"
+        };
+        let counterpart_agent_id = timeline_counterpart_agent_id(&message, agent_id);
+        let (counterpart_name, counterpart_avatar_url) = counterpart_agent_id
+            .and_then(|id| counterparts.get(&id).cloned())
+            .map(|(name, avatar_url)| (Some(name), avatar_url))
+            .unwrap_or((None, None));
+        let relationship =
+            counterpart_agent_id.and_then(|id| relationship_by_counterpart.get(&id).cloned());
+
+        items.push(RelationshipTimelineItemResponse {
+            message_id: message.id,
+            direction: direction.to_owned(),
+            counterpart_agent_id,
+            counterpart_name,
+            counterpart_avatar_url,
+            content: message.content,
+            status: message.status,
+            created_at: message.created_at.to_rfc3339(),
+            relationship,
+        });
+    }
+
+    Ok(items)
+}
+
+fn timeline_counterpart_agent_id(message: &MessageRecord, agent_id: Uuid) -> Option<Uuid> {
+    if message.sender_id == Some(agent_id) {
+        return Some(message.receiver_agent_id);
+    }
+    if message.receiver_agent_id == agent_id {
+        return message.sender_id;
+    }
+    message.sender_id
+}
+
+fn relationship_counterpart_agent_id(
+    edge: &RelationshipItemResponse,
+    agent_id: Uuid,
+) -> Option<Uuid> {
+    if edge.agent_a == agent_id {
+        return Some(edge.agent_b);
+    }
+    if edge.agent_b == agent_id {
+        return Some(edge.agent_a);
+    }
+    None
 }
 
 fn map_event_record(record: &AgentEventRecord) -> EventItemResponse {

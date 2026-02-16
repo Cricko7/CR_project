@@ -491,6 +491,30 @@ impl AgentCoreRepository for PostgresAgentCoreRepository {
         Ok(rows.into_iter().map(map_message_record).collect())
     }
 
+    async fn list_agent_message_timeline(
+        &self,
+        agent_id: Uuid,
+        limit: u32,
+    ) -> Result<Vec<MessageRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, sender_type, sender_id, receiver_agent_id, content, status, created_at
+            FROM messages
+            WHERE receiver_agent_id = $1
+               OR sender_id = $1
+            ORDER BY created_at DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(agent_id)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list agent message timeline")?;
+
+        Ok(rows.into_iter().map(map_message_record).collect())
+    }
+
     async fn upsert_relationship_interaction(
         &self,
         left_agent_id: Uuid,
