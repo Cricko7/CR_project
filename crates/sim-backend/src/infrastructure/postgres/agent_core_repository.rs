@@ -101,6 +101,23 @@ impl AgentCoreRepository for PostgresAgentCoreRepository {
         Ok(row.map(map_agent_record))
     }
 
+    async fn list_agents(&self, limit: u32) -> Result<Vec<AgentRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, name, avatar_url, personality_json, created_at
+            FROM agents
+            ORDER BY created_at ASC
+            LIMIT $1
+            "#,
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list agents")?;
+
+        Ok(rows.into_iter().map(map_agent_record).collect())
+    }
+
     async fn get_agent_state(&self, agent_id: Uuid) -> Result<Option<AgentStateRecord>> {
         let row = sqlx::query(
             r#"

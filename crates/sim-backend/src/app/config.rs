@@ -19,6 +19,10 @@ const DEFAULT_MOOD_DECAY_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_MOOD_DECAY_STEP: f32 = 0.06;
 const DEFAULT_WORKER_MESSAGE_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_WORKER_MESSAGE_BATCH_SIZE: u32 = 32;
+const DEFAULT_WORKER_CONVERSATION_SCAN_INTERVAL_MS: u64 = 3_000;
+const DEFAULT_WORKER_CONVERSATION_MIN_INTERVAL_MS: u64 = 12_000;
+const DEFAULT_WORKER_CONVERSATION_MAX_INTERVAL_MS: u64 = 45_000;
+const DEFAULT_WORKER_CONVERSATION_AGENT_LIMIT: u32 = 512;
 const DEFAULT_DATABASE_MAX_CONNECTIONS: u32 = 10;
 const DEFAULT_DATABASE_CONNECT_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_DATABASE_ACQUIRE_TIMEOUT_MS: u64 = 5_000;
@@ -171,6 +175,10 @@ pub struct WorkerConfig {
     pub mood_decay_step: f32,
     pub message_interval: Duration,
     pub message_batch_size: u32,
+    pub conversation_scan_interval: Duration,
+    pub conversation_min_interval: Duration,
+    pub conversation_max_interval: Duration,
+    pub conversation_agent_limit: u32,
 }
 
 impl WorkerConfig {
@@ -197,6 +205,22 @@ impl WorkerConfig {
         let message_batch_size: u32 = parse_env(
             "WORKER_MESSAGE_BATCH_SIZE",
             DEFAULT_WORKER_MESSAGE_BATCH_SIZE,
+        )?;
+        let conversation_scan_interval_ms: u64 = parse_env(
+            "WORKER_CONVERSATION_SCAN_INTERVAL_MS",
+            DEFAULT_WORKER_CONVERSATION_SCAN_INTERVAL_MS,
+        )?;
+        let conversation_min_interval_ms: u64 = parse_env(
+            "WORKER_CONVERSATION_MIN_INTERVAL_MS",
+            DEFAULT_WORKER_CONVERSATION_MIN_INTERVAL_MS,
+        )?;
+        let conversation_max_interval_ms: u64 = parse_env(
+            "WORKER_CONVERSATION_MAX_INTERVAL_MS",
+            DEFAULT_WORKER_CONVERSATION_MAX_INTERVAL_MS,
+        )?;
+        let conversation_agent_limit: u32 = parse_env(
+            "WORKER_CONVERSATION_AGENT_LIMIT",
+            DEFAULT_WORKER_CONVERSATION_AGENT_LIMIT,
         )?;
 
         if tick_interval_ms == 0 {
@@ -235,6 +259,36 @@ impl WorkerConfig {
                 "must be greater than 0",
             ));
         }
+        if conversation_scan_interval_ms == 0 {
+            return Err(ConfigError::invalid(
+                "WORKER_CONVERSATION_SCAN_INTERVAL_MS",
+                "must be greater than 0",
+            ));
+        }
+        if conversation_min_interval_ms == 0 {
+            return Err(ConfigError::invalid(
+                "WORKER_CONVERSATION_MIN_INTERVAL_MS",
+                "must be greater than 0",
+            ));
+        }
+        if conversation_max_interval_ms == 0 {
+            return Err(ConfigError::invalid(
+                "WORKER_CONVERSATION_MAX_INTERVAL_MS",
+                "must be greater than 0",
+            ));
+        }
+        if conversation_min_interval_ms > conversation_max_interval_ms {
+            return Err(ConfigError::invalid(
+                "WORKER_CONVERSATION_MIN_INTERVAL_MS",
+                "must be less than or equal to WORKER_CONVERSATION_MAX_INTERVAL_MS",
+            ));
+        }
+        if conversation_agent_limit < 2 {
+            return Err(ConfigError::invalid(
+                "WORKER_CONVERSATION_AGENT_LIMIT",
+                "must be at least 2",
+            ));
+        }
 
         Ok(Self {
             common,
@@ -249,6 +303,10 @@ impl WorkerConfig {
             mood_decay_step,
             message_interval: Duration::from_millis(message_interval_ms),
             message_batch_size,
+            conversation_scan_interval: Duration::from_millis(conversation_scan_interval_ms),
+            conversation_min_interval: Duration::from_millis(conversation_min_interval_ms),
+            conversation_max_interval: Duration::from_millis(conversation_max_interval_ms),
+            conversation_agent_limit,
         })
     }
 }
