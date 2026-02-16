@@ -12,10 +12,11 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sim_backend::agent_core::{
     AgentCoreRepository, AgentEventRecord, AgentTickExecutionStatus, AgentTickOrchestrator,
-    AgentTickOrchestratorOutcome, MessageRecord, NewMessage, RelationshipRecord,
+    AgentTickOrchestratorOutcome, InterventionRecord, MessageRecord, NewAgentEvent,
+    NewIntervention, NewMessage, RelationshipRecord,
 };
 use sim_backend::app::config::ApiConfig;
 use sim_backend::app::observability::init_tracing;
@@ -39,6 +40,7 @@ const DEFAULT_WS_SNAPSHOT_LIMIT: u32 = 20;
 const DEFAULT_RECALL_TOP_K: u32 = 8;
 const DEFAULT_RELATIONSHIP_GRAPH_LIMIT: u32 = 200;
 const DEFAULT_INSPECTOR_LIMIT: u32 = 20;
+const DEFAULT_INTERVENTION_LIMIT: u32 = 50;
 
 #[derive(Clone)]
 struct ApiState {
@@ -168,7 +170,7 @@ struct AgentInspectorSummaryResponse {
     memories_count: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct ApiErrorResponse {
     error: &'static str,
     message: String,
@@ -259,6 +261,139 @@ struct DeadLetterEmbeddingItemResponse {
 struct RequeueDeadLetterResponse {
     memory_id: i64,
     requeued: bool,
+}
+
+#[derive(Deserialize)]
+struct CreateInterventionRequest {
+    admin_user_id: String,
+    action: InterventionActionRequest,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum InterventionActionRequest {
+    TriggerTick {
+        agent_id: Uuid,
+        tick_id: Option<String>,
+    },
+    AppendMemory {
+        agent_id: Uuid,
+        content: String,
+        importance: Option<f32>,
+    },
+    SendMessage {
+        sender_agent_id: Uuid,
+        receiver_agent_id: Uuid,
+        content: String,
+    },
+    AppendEvent {
+        agent_id: Option<Uuid>,
+        event_type: String,
+        description: String,
+        payload_json: Option<Value>,
+    },
+}
+
+impl InterventionActionRequest {
+    fn action_type(&self) -> &'static str {
+        match self {
+            Self::TriggerTick { .. } => "trigger_tick",
+            Self::AppendMemory { .. } => "append_memory",
+            Self::SendMessage { .. } => "send_message",
+            Self::AppendEvent { .. } => "append_event",
+        }
+    }
+
+    fn payload_json(&self) -> Value {
+        match self {
+            Self::TriggerTick { agent_id, tick_id } => json!({
+                "agent_id": agent_id,
+                "tick_id": tick_id,
+            }),
+            Self::AppendMemory {
+                agent_id,
+                content,
+                importance,
+            } => json!({
+                "agent_id": agent_id,
+                "content": content,
+                "importance": importance,
+            }),
+            Self::SendMessage {
+                sender_agent_id,
+                receiver_agent_id,
+                content,
+            } => json!({
+                "sender_agent_id": sender_agent_id,
+                "receiver_agent_id": receiver_agent_id,
+                "content": content,
+            }),
+            Self::AppendEvent {
+                agent_id,
+                event_type,
+                description,
+                payload_json,
+            } => json!({
+                "agent_id": agent_id,
+                "event_type": event_type,
+                "description": description,
+                "payload_json": payload_json,
+            }),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct InterventionListQuery {
+    limit: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct InterventionsResponse {
+    items: Vec<InterventionItemResponse>,
+}
+
+#[derive(Serialize)]
+struct CreateInterventionResponse {
+    intervention: InterventionItemResponse,
+    effect: InterventionEffectResponse,
+}
+
+#[derive(Serialize)]
+struct InterventionItemResponse {
+    id: i64,
+    admin_user_id: String,
+    action_type: String,
+    payload_json: Value,
+    result_status: String,
+    created_at: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum InterventionEffectResponse {
+    Tick {
+        agent_id: Uuid,
+        outcome: String,
+        tick_id: Option<String>,
+        event_id: Option<i64>,
+        mood_label: Option<String>,
+        valence: Option<f32>,
+        arousal: Option<f32>,
+    },
+    Memory {
+        agent_id: Uuid,
+        memory_id: i64,
+        embedding_status: String,
+    },
+    Message {
+        message_id: i64,
+        status: String,
+    },
+    Event {
+        event_id: i64,
+        event_type: String,
+    },
 }
 
 #[derive(Deserialize)]
@@ -462,6 +597,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/agents/{id}/state", get(get_agent_state))
         .route("/agents/{id}/inspector", get(get_agent_inspector))
         .route("/events", get(list_events))
+        .route(
+            "/interventions",
+            post(create_intervention).get(list_interventions),
+        )
         .route("/relationships/graph", get(get_relationship_graph))
         .route("/agents/{id}/memories", post(append_agent_memory))
         .route("/agents/{id}/memories/recall", get(recall_agent_memory))
@@ -887,6 +1026,103 @@ async fn get_agent_inspector(
     }))
 }
 
+async fn create_intervention(
+    State(state): State<ApiState>,
+    Json(payload): Json<CreateInterventionRequest>,
+) -> Result<(StatusCode, Json<CreateInterventionResponse>), (StatusCode, Json<ApiErrorResponse>)> {
+    let admin_user_id = payload.admin_user_id.trim().to_owned();
+    if admin_user_id.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorResponse {
+                error: "invalid_admin_user_id",
+                message: "admin_user_id must not be empty".to_owned(),
+            }),
+        ));
+    }
+
+    let action_type = payload.action.action_type().to_owned();
+    let action_payload = payload.action.payload_json();
+
+    let effect = match apply_intervention_action(&state, &payload.action).await {
+        Ok(effect) => effect,
+        Err((status, Json(error_body))) => {
+            let failed_payload = json!({
+                "action": action_payload,
+                "error": {
+                    "code": error_body.error,
+                    "message": error_body.message,
+                }
+            });
+            if let Err(store_error) = state
+                .repository
+                .append_intervention(&NewIntervention {
+                    admin_user_id,
+                    action_type,
+                    payload_json: failed_payload,
+                    result_status: "failed".to_owned(),
+                })
+                .await
+            {
+                tracing::error!(error = %store_error, "failed to persist failed intervention record");
+            }
+            return Err((status, Json(error_body)));
+        }
+    };
+
+    let record = state
+        .repository
+        .append_intervention(&NewIntervention {
+            admin_user_id,
+            action_type,
+            payload_json: json!({
+                "action": action_payload,
+                "effect": effect.clone(),
+            }),
+            result_status: "applied".to_owned(),
+        })
+        .await
+        .map_err(|error| {
+            internal_error(
+                "intervention_store_failed",
+                format!("failed to store intervention: {error}"),
+            )
+        })?;
+
+    Ok((
+        StatusCode::OK,
+        Json(CreateInterventionResponse {
+            intervention: map_intervention_record(record),
+            effect,
+        }),
+    ))
+}
+
+async fn list_interventions(
+    State(state): State<ApiState>,
+    Query(query): Query<InterventionListQuery>,
+) -> Result<Json<InterventionsResponse>, (StatusCode, Json<ApiErrorResponse>)> {
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_INTERVENTION_LIMIT)
+        .clamp(1, 200);
+    let items = state
+        .repository
+        .list_interventions(limit)
+        .await
+        .map_err(|error| {
+            internal_error(
+                "intervention_list_failed",
+                format!("failed to list interventions: {error}"),
+            )
+        })?
+        .into_iter()
+        .map(map_intervention_record)
+        .collect();
+
+    Ok(Json(InterventionsResponse { items }))
+}
+
 async fn list_events(
     State(state): State<ApiState>,
     Query(query): Query<EventsQuery>,
@@ -976,82 +1212,13 @@ async fn send_agent_message(
     Path(receiver_agent_id): Path<Uuid>,
     Json(payload): Json<CreateMessageRequest>,
 ) -> Result<(StatusCode, Json<CreateMessageResponse>), (StatusCode, Json<ApiErrorResponse>)> {
-    if payload.content.trim().is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ApiErrorResponse {
-                error: "invalid_content",
-                message: "message content must not be empty".to_owned(),
-            }),
-        ));
-    }
-    if payload.sender_agent_id == receiver_agent_id {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ApiErrorResponse {
-                error: "invalid_sender",
-                message: "sender and receiver must be different agents".to_owned(),
-            }),
-        ));
-    }
-
-    let sender_exists = state
-        .repository
-        .get_agent(payload.sender_agent_id)
-        .await
-        .map_err(|error| {
-            internal_error(
-                "message_send_failed",
-                format!("failed to load sender agent: {error}"),
-            )
-        })?
-        .is_some();
-    if !sender_exists {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(ApiErrorResponse {
-                error: "sender_not_found",
-                message: format!("sender agent `{}` does not exist", payload.sender_agent_id),
-            }),
-        ));
-    }
-
-    let receiver_exists = state
-        .repository
-        .get_agent(receiver_agent_id)
-        .await
-        .map_err(|error| {
-            internal_error(
-                "message_send_failed",
-                format!("failed to load receiver agent: {error}"),
-            )
-        })?
-        .is_some();
-    if !receiver_exists {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(ApiErrorResponse {
-                error: "receiver_not_found",
-                message: format!("receiver agent `{}` does not exist", receiver_agent_id),
-            }),
-        ));
-    }
-
-    let message = state
-        .repository
-        .enqueue_message(&NewMessage {
-            sender_type: "agent".to_owned(),
-            sender_id: Some(payload.sender_agent_id),
-            receiver_agent_id,
-            content: payload.content.trim().to_owned(),
-        })
-        .await
-        .map_err(|error| {
-            internal_error(
-                "message_send_failed",
-                format!("failed to enqueue agent message: {error}"),
-            )
-        })?;
+    let message = enqueue_agent_message(
+        state.repository.as_ref(),
+        payload.sender_agent_id,
+        receiver_agent_id,
+        payload.content,
+    )
+    .await?;
 
     Ok((
         StatusCode::ACCEPTED,
@@ -1261,6 +1428,318 @@ async fn requeue_dead_letter_embedding(
         memory_id,
         requeued,
     }))
+}
+
+async fn apply_intervention_action(
+    state: &ApiState,
+    action: &InterventionActionRequest,
+) -> Result<InterventionEffectResponse, (StatusCode, Json<ApiErrorResponse>)> {
+    match action {
+        InterventionActionRequest::TriggerTick { agent_id, tick_id } => {
+            let outcome = state
+                .orchestrator
+                .run_agent_tick(*agent_id, tick_id.clone())
+                .await
+                .map_err(|error| {
+                    internal_error(
+                        "intervention_apply_failed",
+                        format!("failed to run intervention tick: {error}"),
+                    )
+                })?;
+
+            match outcome {
+                AgentTickOrchestratorOutcome::Executed(result) => match result.status {
+                    AgentTickExecutionStatus::Applied => {
+                        if let Err(error) = state
+                            .memory_service
+                            .append_memory(
+                                result.agent_id,
+                                format!(
+                                    "{} (mood={}, valence={:.2}, arousal={:.2})",
+                                    result.action_summary,
+                                    result.mood_label,
+                                    result.valence,
+                                    result.arousal
+                                ),
+                                0.7,
+                            )
+                            .await
+                        {
+                            tracing::error!(agent_id = %result.agent_id, error = %error, "failed to persist episodic memory from intervention tick");
+                        }
+
+                        Ok(InterventionEffectResponse::Tick {
+                            agent_id: result.agent_id,
+                            outcome: "applied".to_owned(),
+                            tick_id: Some(result.tick_id),
+                            event_id: result.event_id,
+                            mood_label: Some(result.mood_label),
+                            valence: Some(result.valence),
+                            arousal: Some(result.arousal),
+                        })
+                    }
+                    AgentTickExecutionStatus::AgentMissing => Err((
+                        StatusCode::NOT_FOUND,
+                        Json(ApiErrorResponse {
+                            error: "agent_not_found",
+                            message: format!("agent `{}` does not exist", result.agent_id),
+                        }),
+                    )),
+                },
+                AgentTickOrchestratorOutcome::SkippedBusy => {
+                    state.event_hub.publish(WsServerEvent::TickSkipped {
+                        agent_id: *agent_id,
+                        reason: "busy".to_owned(),
+                        tick_id: tick_id.clone(),
+                    });
+                    Ok(InterventionEffectResponse::Tick {
+                        agent_id: *agent_id,
+                        outcome: "skipped_busy".to_owned(),
+                        tick_id: tick_id.clone(),
+                        event_id: None,
+                        mood_label: None,
+                        valence: None,
+                        arousal: None,
+                    })
+                }
+                AgentTickOrchestratorOutcome::SkippedDuplicate => {
+                    state.event_hub.publish(WsServerEvent::TickSkipped {
+                        agent_id: *agent_id,
+                        reason: "duplicate".to_owned(),
+                        tick_id: tick_id.clone(),
+                    });
+                    Ok(InterventionEffectResponse::Tick {
+                        agent_id: *agent_id,
+                        outcome: "skipped_duplicate".to_owned(),
+                        tick_id: tick_id.clone(),
+                        event_id: None,
+                        mood_label: None,
+                        valence: None,
+                        arousal: None,
+                    })
+                }
+            }
+        }
+        InterventionActionRequest::AppendMemory {
+            agent_id,
+            content,
+            importance,
+        } => {
+            if content.trim().is_empty() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiErrorResponse {
+                        error: "invalid_content",
+                        message: "memory content must not be empty".to_owned(),
+                    }),
+                ));
+            }
+
+            let agent_exists = state
+                .repository
+                .get_agent(*agent_id)
+                .await
+                .map_err(|error| {
+                    internal_error(
+                        "intervention_apply_failed",
+                        format!("failed to load intervention target agent: {error}"),
+                    )
+                })?
+                .is_some();
+            if !agent_exists {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(ApiErrorResponse {
+                        error: "agent_not_found",
+                        message: format!("agent `{agent_id}` does not exist"),
+                    }),
+                ));
+            }
+
+            let memory = state
+                .memory_service
+                .append_memory(*agent_id, content.clone(), importance.unwrap_or(0.6))
+                .await
+                .map_err(|error| {
+                    internal_error(
+                        "intervention_apply_failed",
+                        format!("failed to append memory intervention: {error}"),
+                    )
+                })?;
+
+            Ok(InterventionEffectResponse::Memory {
+                agent_id: *agent_id,
+                memory_id: memory.id,
+                embedding_status: memory.embedding_status,
+            })
+        }
+        InterventionActionRequest::SendMessage {
+            sender_agent_id,
+            receiver_agent_id,
+            content,
+        } => {
+            let message = enqueue_agent_message(
+                state.repository.as_ref(),
+                *sender_agent_id,
+                *receiver_agent_id,
+                content.clone(),
+            )
+            .await?;
+            Ok(InterventionEffectResponse::Message {
+                message_id: message.id,
+                status: message.status,
+            })
+        }
+        InterventionActionRequest::AppendEvent {
+            agent_id,
+            event_type,
+            description,
+            payload_json,
+        } => {
+            if event_type.trim().is_empty() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiErrorResponse {
+                        error: "invalid_event_type",
+                        message: "event_type must not be empty".to_owned(),
+                    }),
+                ));
+            }
+            if description.trim().is_empty() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiErrorResponse {
+                        error: "invalid_description",
+                        message: "description must not be empty".to_owned(),
+                    }),
+                ));
+            }
+            if let Some(agent_id) = agent_id {
+                let exists = state
+                    .repository
+                    .get_agent(*agent_id)
+                    .await
+                    .map_err(|error| {
+                        internal_error(
+                            "intervention_apply_failed",
+                            format!("failed to load event target agent: {error}"),
+                        )
+                    })?
+                    .is_some();
+                if !exists {
+                    return Err((
+                        StatusCode::NOT_FOUND,
+                        Json(ApiErrorResponse {
+                            error: "agent_not_found",
+                            message: format!("agent `{agent_id}` does not exist"),
+                        }),
+                    ));
+                }
+            }
+
+            let event = state
+                .repository
+                .append_agent_event(&NewAgentEvent {
+                    agent_id: *agent_id,
+                    event_type: event_type.trim().to_owned(),
+                    description: description.trim().to_owned(),
+                    payload_json: payload_json.clone().unwrap_or_else(|| json!({})),
+                })
+                .await
+                .map_err(|error| {
+                    internal_error(
+                        "intervention_apply_failed",
+                        format!("failed to append intervention event: {error}"),
+                    )
+                })?;
+
+            Ok(InterventionEffectResponse::Event {
+                event_id: event.id,
+                event_type: event.event_type,
+            })
+        }
+    }
+}
+
+async fn enqueue_agent_message(
+    repository: &dyn AgentCoreRepository,
+    sender_agent_id: Uuid,
+    receiver_agent_id: Uuid,
+    content: String,
+) -> Result<MessageRecord, (StatusCode, Json<ApiErrorResponse>)> {
+    if content.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorResponse {
+                error: "invalid_content",
+                message: "message content must not be empty".to_owned(),
+            }),
+        ));
+    }
+    if sender_agent_id == receiver_agent_id {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorResponse {
+                error: "invalid_sender",
+                message: "sender and receiver must be different agents".to_owned(),
+            }),
+        ));
+    }
+
+    let sender_exists = repository
+        .get_agent(sender_agent_id)
+        .await
+        .map_err(|error| {
+            internal_error(
+                "message_send_failed",
+                format!("failed to load sender agent: {error}"),
+            )
+        })?
+        .is_some();
+    if !sender_exists {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiErrorResponse {
+                error: "sender_not_found",
+                message: format!("sender agent `{sender_agent_id}` does not exist"),
+            }),
+        ));
+    }
+
+    let receiver_exists = repository
+        .get_agent(receiver_agent_id)
+        .await
+        .map_err(|error| {
+            internal_error(
+                "message_send_failed",
+                format!("failed to load receiver agent: {error}"),
+            )
+        })?
+        .is_some();
+    if !receiver_exists {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiErrorResponse {
+                error: "receiver_not_found",
+                message: format!("receiver agent `{receiver_agent_id}` does not exist"),
+            }),
+        ));
+    }
+
+    repository
+        .enqueue_message(&NewMessage {
+            sender_type: "agent".to_owned(),
+            sender_id: Some(sender_agent_id),
+            receiver_agent_id,
+            content: content.trim().to_owned(),
+        })
+        .await
+        .map_err(|error| {
+            internal_error(
+                "message_send_failed",
+                format!("failed to enqueue agent message: {error}"),
+            )
+        })
 }
 
 async fn ws_events(
@@ -1604,6 +2083,17 @@ fn map_inspector_memory(memory: MemoryEntryRecord) -> InspectorMemoryItemRespons
         is_summary: memory.is_summary,
         embedding_status: memory.embedding_status,
         created_at: memory.created_at.to_rfc3339(),
+    }
+}
+
+fn map_intervention_record(record: InterventionRecord) -> InterventionItemResponse {
+    InterventionItemResponse {
+        id: record.id,
+        admin_user_id: record.admin_user_id,
+        action_type: record.action_type,
+        payload_json: record.payload_json,
+        result_status: record.result_status,
+        created_at: record.created_at.to_rfc3339(),
     }
 }
 

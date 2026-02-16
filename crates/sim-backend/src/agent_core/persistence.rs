@@ -72,6 +72,24 @@ pub struct RelationshipRecord {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone)]
+pub struct InterventionRecord {
+    pub id: i64,
+    pub admin_user_id: String,
+    pub action_type: String,
+    pub payload_json: Value,
+    pub result_status: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewIntervention {
+    pub admin_user_id: String,
+    pub action_type: String,
+    pub payload_json: Value,
+    pub result_status: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TickLeaseAcquireResult {
     Acquired,
@@ -132,4 +150,9 @@ pub trait AgentCoreRepository: Send + Sync {
         limit: u32,
     ) -> Result<Vec<RelationshipRecord>>;
     async fn list_relationships(&self, limit: u32) -> Result<Vec<RelationshipRecord>>;
+    async fn append_intervention(
+        &self,
+        intervention: &NewIntervention,
+    ) -> Result<InterventionRecord>;
+    async fn list_interventions(&self, limit: u32) -> Result<Vec<InterventionRecord>>;
 }

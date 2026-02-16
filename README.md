@@ -27,7 +27,7 @@ Backend для симуляции мира автономных AI-агенто�
 | 5. Real-time dashboard life feed | `FULLY IMPLEMENTED` | Реализован единый live feed через `/ws/events` для событий из API и worker (DB tail bridge), а также cursor polling через `/events?after_id=...` |
 | 6. Граф отношений | `FULLY IMPLEMENTED` | Есть graph snapshot API (`/relationships/graph`) и live stream (`/ws/relationships`); worker публикует `agent.relationship.updated` события |
 | 7. Inspector агента | `FULLY IMPLEMENTED` | Есть агрегирующий endpoint `/agents/{id}/inspector` (agent profile + state + recent events/messages/relationships/memories + optional recall) |
-| 8. Панель вмешательства | `PARTIAL` | Есть endpoint ручного тика и memory append; отдельные intervention endpoints пока не готовы |
+| 8. Панель вмешательства | `FULLY IMPLEMENTED` | Реализованы `POST/GET /interventions` с action-типами (`trigger_tick`, `append_memory`, `send_message`, `append_event`) и audit-log в таблице `interventions` |
 | Доп. фича 1: настроение влияет на стиль речи | `PARTIAL` | Mood передается в prompt, но полноценные style policies не оформлены |
 | Доп. фича 2: страница агента с историей отношений | `PARTIAL` | Backend API для отношений есть; нужен frontend-экран и timeline-агрегации |
 
@@ -127,8 +127,9 @@ flowchart LR
 
 ### Interventions
 - Текущее состояние:
-  - есть `interventions` таблица и частично ручные API-операции;
-  - нет завершенного workflow вмешательств.
+  - есть полноценный API панели вмешательства: `POST /interventions`, `GET /interventions`;
+  - поддержаны action-типы: `trigger_tick`, `append_memory`, `send_message`, `append_event`;
+  - все запросы фиксируются в `interventions` с `result_status=applied|failed`.
 
 ### Observability
 - Файлы: `crates/sim-backend/src/app/observability.rs`, `runtime.rs`
@@ -262,6 +263,12 @@ CR_project/
 2. API параллельно читает: profile/state/events/messages/relationships/memories.
 3. При наличии `recall_query` API дополнительно запускает vector recall и включает блок релевантных memories.
 4. Dashboard получает готовый агрегированный срез для страницы агента одним запросом.
+
+### 7.8 Intervention flow
+1. Клиент панели вызывает `POST /interventions` с `admin_user_id` и `action`.
+2. API выполняет действие (`tick`, `memory append`, `message enqueue`, `event append`).
+3. Результат и payload действия сохраняются в таблице `interventions`.
+4. История действий читается через `GET /interventions`.
 
 ---
 
@@ -403,6 +410,66 @@ Response:
     }
   ],
   "next_after_id": 1
+}
+```
+
+### 8.4.1 Interventions
+
+#### `POST /interventions`
+
+Request:
+```json
+{
+  "admin_user_id": "demo-admin",
+  "action": {
+    "type": "send_message",
+    "sender_agent_id": "uuid-a",
+    "receiver_agent_id": "uuid-b",
+    "content": "Hold position and report status."
+  }
+}
+```
+
+Поддерживаемые `action.type`:
+- `trigger_tick`
+- `append_memory`
+- `send_message`
+- `append_event`
+
+Response (`200`):
+```json
+{
+  "intervention": {
+    "id": 21,
+    "admin_user_id": "demo-admin",
+    "action_type": "send_message",
+    "payload_json": {"action": {...}, "effect": {...}},
+    "result_status": "applied",
+    "created_at": "2026-02-16T12:00:00Z"
+  },
+  "effect": {
+    "type": "message",
+    "message_id": 77,
+    "status": "queued"
+  }
+}
+```
+
+#### `GET /interventions?limit=<1..200>`
+
+Response:
+```json
+{
+  "items": [
+    {
+      "id": 21,
+      "admin_user_id": "demo-admin",
+      "action_type": "send_message",
+      "payload_json": {"action": {...}, "effect": {...}},
+      "result_status": "applied",
+      "created_at": "2026-02-16T12:00:00Z"
+    }
+  ]
 }
 ```
 
@@ -699,7 +766,7 @@ Examples:
 - `memory_entries`: эпизодическая и summary память.
 - `relationships`: affinity/history между агентами, обновляется из message delivery.
 - `messages`: очередь межагентных сообщений + delivery status machine.
-- `interventions`: каркас админ-вмешательств.
+- `interventions`: журнал админ-вмешательств (action payload + `result_status`).
 - `outbox_events`: каркас event publication.
 
 Колонки long-term memory:
@@ -955,7 +1022,7 @@ VALUES
    - vector recall;
    - overflow summarization.
 7. Qdrant adapter и Gemini adapters.
-8. REST endpoints для state/events/memory/ticks/messages/relationships + relationship graph snapshot + agent inspector profile.
+8. REST endpoints для state/events/memory/ticks/messages/relationships + relationship graph snapshot + agent inspector profile + interventions panel.
 9. WebSocket endpoints `/ws/events` и `/ws/relationships` с snapshot + live updates.
 10. Worker циклы: ticks, mood-decay, message delivery, embedding, summarization.
 11. Миграции для базовой схемы, long-term memory, concurrency/failure hardening и мультиагентной коммуникации.
@@ -969,10 +1036,8 @@ VALUES
 
 ### P0 (обязательно для демонстрации целевого кейса)
 1. Реализовать auth (JWT/API key) для admin операций.
-2. Добавить CRUD/API для:
-   - interventions (add event, send message).
-3. Расширить message pipeline до гарантированной доставки (retry/DLQ/ack semantics на уровне сообщений).
-4. Доработать policy-слой эмоционального интеллекта (domain-specific rules per world/agent class).
+2. Расширить message pipeline до гарантированной доставки (retry/DLQ/ack semantics на уровне сообщений).
+3. Доработать policy-слой эмоционального интеллекта (domain-specific rules per world/agent class).
 
 ### P1 (нужно для полноты симуляции)
 1. Добавить policy-конфиг для stage pipeline (пер-агентные ограничения/приоритеты целей).

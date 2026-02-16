@@ -9,8 +9,9 @@ use sqlx::postgres::PgPool;
 use uuid::Uuid;
 
 use crate::agent_core::{
-    AgentCoreRepository, AgentEventRecord, AgentRecord, AgentStateRecord, MessageRecord,
-    NewAgentEvent, NewMessage, RelationshipRecord, TickLeaseAcquireResult,
+    AgentCoreRepository, AgentEventRecord, AgentRecord, AgentStateRecord, InterventionRecord,
+    MessageRecord, NewAgentEvent, NewIntervention, NewMessage, RelationshipRecord,
+    TickLeaseAcquireResult,
 };
 
 #[derive(Clone)]
@@ -582,6 +583,45 @@ impl AgentCoreRepository for PostgresAgentCoreRepository {
 
         Ok(rows.into_iter().map(map_relationship_record).collect())
     }
+
+    async fn append_intervention(
+        &self,
+        intervention: &NewIntervention,
+    ) -> Result<InterventionRecord> {
+        let row = sqlx::query(
+            r#"
+            INSERT INTO interventions (admin_user_id, action_type, payload_json, result_status)
+            VALUES ($1, $2, $3, $4)
+            RETURNING id, admin_user_id, action_type, payload_json, result_status, created_at
+            "#,
+        )
+        .bind(&intervention.admin_user_id)
+        .bind(&intervention.action_type)
+        .bind(&intervention.payload_json)
+        .bind(&intervention.result_status)
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to append intervention")?;
+
+        Ok(map_intervention_record(row))
+    }
+
+    async fn list_interventions(&self, limit: u32) -> Result<Vec<InterventionRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, admin_user_id, action_type, payload_json, result_status, created_at
+            FROM interventions
+            ORDER BY created_at DESC
+            LIMIT $1
+            "#,
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list interventions")?;
+
+        Ok(rows.into_iter().map(map_intervention_record).collect())
+    }
 }
 
 fn map_agent_record(row: sqlx::postgres::PgRow) -> AgentRecord {
@@ -635,6 +675,17 @@ fn map_relationship_record(row: sqlx::postgres::PgRow) -> RelationshipRecord {
         affinity_score: row.get::<f32, _>("affinity_score"),
         history_summary: row.get::<String, _>("history_summary"),
         last_interaction_at: row.get::<Option<DateTime<Utc>>, _>("last_interaction_at"),
+        created_at: row.get::<DateTime<Utc>, _>("created_at"),
+    }
+}
+
+fn map_intervention_record(row: sqlx::postgres::PgRow) -> InterventionRecord {
+    InterventionRecord {
+        id: row.get::<i64, _>("id"),
+        admin_user_id: row.get::<String, _>("admin_user_id"),
+        action_type: row.get::<String, _>("action_type"),
+        payload_json: row.get::<Value, _>("payload_json"),
+        result_status: row.get::<String, _>("result_status"),
         created_at: row.get::<DateTime<Utc>, _>("created_at"),
     }
 }

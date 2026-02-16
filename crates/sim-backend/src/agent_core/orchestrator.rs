@@ -691,8 +691,9 @@ mod tests {
     use uuid::Uuid;
 
     use crate::agent_core::{
-        AgentCoreRepository, AgentEventRecord, AgentRecord, AgentStateRecord, MessageRecord,
-        NewAgentEvent, NewMessage, RelationshipRecord, TickLeaseAcquireResult,
+        AgentCoreRepository, AgentEventRecord, AgentRecord, AgentStateRecord, InterventionRecord,
+        MessageRecord, NewAgentEvent, NewIntervention, NewMessage, RelationshipRecord,
+        TickLeaseAcquireResult,
     };
     use crate::llm::{LlmGenerateRequest, LlmGenerateResponse, LlmPort};
 
@@ -935,6 +936,24 @@ mod tests {
         }
 
         async fn list_relationships(&self, _limit: u32) -> Result<Vec<RelationshipRecord>> {
+            Ok(Vec::new())
+        }
+
+        async fn append_intervention(
+            &self,
+            intervention: &NewIntervention,
+        ) -> Result<InterventionRecord> {
+            Ok(InterventionRecord {
+                id: 1,
+                admin_user_id: intervention.admin_user_id.clone(),
+                action_type: intervention.action_type.clone(),
+                payload_json: intervention.payload_json.clone(),
+                result_status: intervention.result_status.clone(),
+                created_at: Utc::now(),
+            })
+        }
+
+        async fn list_interventions(&self, _limit: u32) -> Result<Vec<InterventionRecord>> {
             Ok(Vec::new())
         }
     }
