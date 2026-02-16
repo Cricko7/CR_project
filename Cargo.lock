@@ -2847,6 +2847,8 @@ name = "worker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
+ "serde_json",
  "sim-backend",
  "tokio",
  "tracing",

@@ -15,6 +15,8 @@ const DEFAULT_WORKER_TICK_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_WORKER_TICK_CONCURRENCY: u32 = 8;
 const DEFAULT_MOOD_DECAY_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_MOOD_DECAY_STEP: f32 = 0.06;
+const DEFAULT_WORKER_MESSAGE_INTERVAL_MS: u64 = 1_000;
+const DEFAULT_WORKER_MESSAGE_BATCH_SIZE: u32 = 32;
 const DEFAULT_DATABASE_MAX_CONNECTIONS: u32 = 10;
 const DEFAULT_DATABASE_CONNECT_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_DATABASE_ACQUIRE_TIMEOUT_MS: u64 = 5_000;
@@ -139,6 +141,8 @@ pub struct WorkerConfig {
     pub tick_concurrency: u32,
     pub mood_decay_interval: Duration,
     pub mood_decay_step: f32,
+    pub message_interval: Duration,
+    pub message_batch_size: u32,
 }
 
 impl WorkerConfig {
@@ -158,6 +162,14 @@ impl WorkerConfig {
             DEFAULT_MOOD_DECAY_INTERVAL_MS,
         )?;
         let mood_decay_step: f32 = parse_env("WORKER_MOOD_DECAY_STEP", DEFAULT_MOOD_DECAY_STEP)?;
+        let message_interval_ms: u64 = parse_env(
+            "WORKER_MESSAGE_INTERVAL_MS",
+            DEFAULT_WORKER_MESSAGE_INTERVAL_MS,
+        )?;
+        let message_batch_size: u32 = parse_env(
+            "WORKER_MESSAGE_BATCH_SIZE",
+            DEFAULT_WORKER_MESSAGE_BATCH_SIZE,
+        )?;
 
         if tick_interval_ms == 0 {
             return Err(ConfigError::invalid(
@@ -183,6 +195,18 @@ impl WorkerConfig {
                 "must be in range (0.0, 1.0]",
             ));
         }
+        if message_interval_ms == 0 {
+            return Err(ConfigError::invalid(
+                "WORKER_MESSAGE_INTERVAL_MS",
+                "must be greater than 0",
+            ));
+        }
+        if message_batch_size == 0 {
+            return Err(ConfigError::invalid(
+                "WORKER_MESSAGE_BATCH_SIZE",
+                "must be greater than 0",
+            ));
+        }
 
         Ok(Self {
             common,
@@ -195,6 +219,8 @@ impl WorkerConfig {
             tick_concurrency,
             mood_decay_interval: Duration::from_millis(mood_decay_interval_ms),
             mood_decay_step,
+            message_interval: Duration::from_millis(message_interval_ms),
+            message_batch_size,
         })
     }
 }

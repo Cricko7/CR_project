@@ -1,8 +1,11 @@
 use std::sync::Arc;
+use std::time::Duration;
 
+use chrono::Utc;
+use serde_json::json;
 use sim_backend::agent_core::{
     AgentCoreRepository, AgentTickExecutionStatus, AgentTickOrchestrator,
-    AgentTickOrchestratorOutcome,
+    AgentTickOrchestratorOutcome, MessageRecord, NewAgentEvent,
 };
 use sim_backend::app::config::WorkerConfig;
 use sim_backend::app::observability::init_tracing;
@@ -20,6 +23,9 @@ use sim_backend::memory::{
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use uuid::Uuid;
+
+const MESSAGE_CLAIM_TIMEOUT: Duration = Duration::from_secs(60);
+const MESSAGE_EVENT_DESCRIPTION_CHARS: usize = 200;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -56,7 +62,8 @@ async fn main() -> anyhow::Result<()> {
 
     let postgres_agent_repository = Arc::new(PostgresAgentCoreRepository::new(db_pool));
     let repository: Arc<dyn AgentCoreRepository> = postgres_agent_repository.clone();
-    let orchestrator = AgentTickOrchestrator::new(repository).with_optional_llm(gemini_client);
+    let orchestrator =
+        AgentTickOrchestrator::new(repository.clone()).with_optional_llm(gemini_client);
 
     let mut runtime = ServiceRuntime::new(
         config.common.service_name.clone(),
@@ -218,6 +225,38 @@ async fn main() -> anyhow::Result<()> {
         Ok(())
     });
 
+    let message_interval = config.message_interval;
+    let message_batch_size = config.message_batch_size;
+    let message_repository = repository.clone();
+    let message_token = cancellation.clone();
+    runtime.spawn("message_delivery_worker", async move {
+        let mut interval = tokio::time::interval(message_interval);
+        loop {
+            tokio::select! {
+                _ = message_token.cancelled() => {
+                    tracing::info!("message delivery worker received shutdown");
+                    break;
+                }
+                _ = interval.tick() => {
+                    match message_repository
+                        .claim_queued_messages(message_batch_size, MESSAGE_CLAIM_TIMEOUT)
+                        .await
+                    {
+                        Ok(messages) => {
+                            for message in messages {
+                                process_agent_message(&*message_repository, &message).await;
+                            }
+                        }
+                        Err(error) => {
+                            tracing::error!(error = %error, "message delivery worker failed to claim messages");
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    });
+
     runtime.run_until_shutdown().await
 }
 
@@ -276,4 +315,125 @@ async fn process_agent_tick(
             tracing::error!(agent_id = %agent_id, error = %error, "agent tick failed");
         }
     }
+}
+
+async fn process_agent_message(repository: &dyn AgentCoreRepository, message: &MessageRecord) {
+    let process = async {
+        let description = format!(
+            "Agent message received: {}",
+            trim_text(&message.content, MESSAGE_EVENT_DESCRIPTION_CHARS)
+        );
+
+        repository
+            .append_agent_event(&NewAgentEvent {
+                agent_id: Some(message.receiver_agent_id),
+                event_type: "agent.message.received".to_owned(),
+                description,
+                payload_json: json!({
+                    "message_id": message.id,
+                    "sender_type": message.sender_type,
+                    "sender_id": message.sender_id,
+                    "receiver_agent_id": message.receiver_agent_id,
+                    "content": message.content,
+                }),
+            })
+            .await?;
+
+        if let Some(sender_agent_id) = message.sender_id {
+            let affinity_delta = message_affinity_delta(&message.content);
+            let relationship = repository
+                .upsert_relationship_interaction(
+                    sender_agent_id,
+                    message.receiver_agent_id,
+                    affinity_delta,
+                    &trim_text(&message.content, 280),
+                    Utc::now(),
+                )
+                .await?;
+            tracing::debug!(
+                message_id = message.id,
+                sender = %sender_agent_id,
+                receiver = %message.receiver_agent_id,
+                affinity = relationship.affinity_score,
+                "relationship updated from delivered message"
+            );
+        }
+
+        repository.mark_message_delivered(message.id).await?;
+        anyhow::Result::<()>::Ok(())
+    }
+    .await;
+
+    match process {
+        Ok(()) => {
+            tracing::info!(
+                message_id = message.id,
+                receiver_agent_id = %message.receiver_agent_id,
+                "message delivered"
+            );
+        }
+        Err(error) => {
+            if let Err(mark_error) = repository
+                .mark_message_failed(message.id, &error.to_string())
+                .await
+            {
+                tracing::error!(
+                    message_id = message.id,
+                    error = %mark_error,
+                    "failed to mark message as failed"
+                );
+            }
+            tracing::error!(
+                message_id = message.id,
+                receiver_agent_id = %message.receiver_agent_id,
+                error = %error,
+                "message delivery failed"
+            );
+        }
+    }
+}
+
+fn message_affinity_delta(content: &str) -> f32 {
+    let normalized = content.to_lowercase();
+    let positive = keyword_hits(
+        &normalized,
+        &[
+            "thanks",
+            "help",
+            "cooperate",
+            "support",
+            "trust",
+            "friendly",
+            "great",
+            "good",
+            "appreciate",
+        ],
+    );
+    let negative = keyword_hits(
+        &normalized,
+        &[
+            "hate", "threat", "attack", "angry", "bad", "conflict", "blame", "insult", "fight",
+        ],
+    );
+
+    ((positive as f32 * 0.08) - (negative as f32 * 0.1)).clamp(-0.3, 0.3)
+}
+
+fn keyword_hits(content: &str, keywords: &[&str]) -> usize {
+    keywords
+        .iter()
+        .filter(|token| content.contains(*token))
+        .count()
+}
+
+fn trim_text(input: &str, max_chars: usize) -> String {
+    if input.chars().count() <= max_chars {
+        return input.trim().to_owned();
+    }
+    input
+        .chars()
+        .take(max_chars)
+        .collect::<String>()
+        .trim()
+        .to_owned()
 }

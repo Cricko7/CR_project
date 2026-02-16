@@ -9,8 +9,8 @@ use sqlx::postgres::PgPool;
 use uuid::Uuid;
 
 use crate::agent_core::{
-    AgentCoreRepository, AgentEventRecord, AgentRecord, AgentStateRecord, NewAgentEvent,
-    TickLeaseAcquireResult,
+    AgentCoreRepository, AgentEventRecord, AgentRecord, AgentStateRecord, MessageRecord,
+    NewAgentEvent, NewMessage, RelationshipRecord, TickLeaseAcquireResult,
 };
 
 #[derive(Clone)]
@@ -296,6 +296,204 @@ impl AgentCoreRepository for PostgresAgentCoreRepository {
         .context("failed to persist completed tick idempotency record")?;
         Ok(())
     }
+
+    async fn enqueue_message(&self, new_message: &NewMessage) -> Result<MessageRecord> {
+        let row = sqlx::query(
+            r#"
+            INSERT INTO messages (sender_type, sender_id, receiver_agent_id, content, status)
+            VALUES ($1, $2, $3, $4, 'queued')
+            RETURNING id, sender_type, sender_id, receiver_agent_id, content, status, created_at
+            "#,
+        )
+        .bind(&new_message.sender_type)
+        .bind(new_message.sender_id)
+        .bind(new_message.receiver_agent_id)
+        .bind(&new_message.content)
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to enqueue message")?;
+
+        Ok(map_message_record(row))
+    }
+
+    async fn claim_queued_messages(
+        &self,
+        limit: u32,
+        claim_timeout: Duration,
+    ) -> Result<Vec<MessageRecord>> {
+        let timeout_ms = i64::try_from(claim_timeout.as_millis())
+            .unwrap_or(i64::MAX)
+            .max(1);
+        let rows = sqlx::query(
+            r#"
+            WITH claimed AS (
+                SELECT id
+                FROM messages
+                WHERE
+                    status = 'queued'
+                    OR (
+                        status = 'processing'
+                        AND processing_claimed_at IS NOT NULL
+                        AND processing_claimed_at <= NOW() - ($2 * INTERVAL '1 millisecond')
+                    )
+                ORDER BY created_at ASC
+                LIMIT $1
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE messages AS message
+            SET status = 'processing',
+                processing_claimed_at = NOW(),
+                delivery_error = NULL
+            FROM claimed
+            WHERE message.id = claimed.id
+            RETURNING message.id, message.sender_type, message.sender_id, message.receiver_agent_id,
+                      message.content, message.status, message.created_at
+            "#,
+        )
+        .bind(i64::from(limit))
+        .bind(timeout_ms)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to claim queued messages")?;
+
+        Ok(rows.into_iter().map(map_message_record).collect())
+    }
+
+    async fn mark_message_delivered(&self, message_id: i64) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE messages
+            SET status = 'delivered',
+                processing_claimed_at = NULL,
+                delivery_error = NULL,
+                delivered_at = NOW()
+            WHERE id = $1
+            "#,
+        )
+        .bind(message_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to mark message delivered")?;
+        Ok(())
+    }
+
+    async fn mark_message_failed(&self, message_id: i64, error: &str) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE messages
+            SET status = 'failed',
+                processing_claimed_at = NULL,
+                delivery_attempts = delivery_attempts + 1,
+                delivery_error = $2
+            WHERE id = $1
+            "#,
+        )
+        .bind(message_id)
+        .bind(error)
+        .execute(&self.pool)
+        .await
+        .context("failed to mark message failed")?;
+        Ok(())
+    }
+
+    async fn list_agent_messages(
+        &self,
+        receiver_agent_id: Uuid,
+        limit: u32,
+    ) -> Result<Vec<MessageRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, sender_type, sender_id, receiver_agent_id, content, status, created_at
+            FROM messages
+            WHERE receiver_agent_id = $1
+            ORDER BY created_at DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(receiver_agent_id)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list agent messages")?;
+
+        Ok(rows.into_iter().map(map_message_record).collect())
+    }
+
+    async fn upsert_relationship_interaction(
+        &self,
+        left_agent_id: Uuid,
+        right_agent_id: Uuid,
+        affinity_delta: f32,
+        interaction_summary: &str,
+        interaction_at: DateTime<Utc>,
+    ) -> Result<RelationshipRecord> {
+        let (agent_a, agent_b) = normalize_relationship_pair(left_agent_id, right_agent_id);
+        let summary = interaction_summary.trim();
+        let row = sqlx::query(
+            r#"
+            INSERT INTO relationships (
+                agent_a,
+                agent_b,
+                affinity_score,
+                history_summary,
+                last_interaction_at
+            )
+            VALUES (
+                $1,
+                $2,
+                LEAST(1.0, GREATEST(-1.0, $3)),
+                LEFT($4, 2000),
+                $5
+            )
+            ON CONFLICT (agent_a, agent_b)
+            DO UPDATE SET
+                affinity_score = LEAST(1.0, GREATEST(-1.0, relationships.affinity_score + $3)),
+                history_summary = LEFT(
+                    CASE
+                        WHEN relationships.history_summary = '' THEN $4
+                        WHEN $4 = '' THEN relationships.history_summary
+                        ELSE relationships.history_summary || ' | ' || $4
+                    END,
+                    2000
+                ),
+                last_interaction_at = $5
+            RETURNING id, agent_a, agent_b, affinity_score, history_summary, last_interaction_at, created_at
+            "#,
+        )
+        .bind(agent_a)
+        .bind(agent_b)
+        .bind(affinity_delta.clamp(-1.0, 1.0))
+        .bind(summary)
+        .bind(interaction_at)
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to upsert relationship interaction")?;
+
+        Ok(map_relationship_record(row))
+    }
+
+    async fn list_agent_relationships(
+        &self,
+        agent_id: Uuid,
+        limit: u32,
+    ) -> Result<Vec<RelationshipRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, agent_a, agent_b, affinity_score, history_summary, last_interaction_at, created_at
+            FROM relationships
+            WHERE agent_a = $1 OR agent_b = $1
+            ORDER BY COALESCE(last_interaction_at, created_at) DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(agent_id)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list agent relationships")?;
+
+        Ok(rows.into_iter().map(map_relationship_record).collect())
+    }
 }
 
 fn map_agent_record(row: sqlx::postgres::PgRow) -> AgentRecord {
@@ -326,5 +524,37 @@ fn map_agent_event_record(row: sqlx::postgres::PgRow) -> AgentEventRecord {
         description: row.get::<String, _>("description"),
         payload_json: row.get::<Value, _>("payload_json"),
         occurred_at: row.get::<DateTime<Utc>, _>("occurred_at"),
+    }
+}
+
+fn map_message_record(row: sqlx::postgres::PgRow) -> MessageRecord {
+    MessageRecord {
+        id: row.get::<i64, _>("id"),
+        sender_type: row.get::<String, _>("sender_type"),
+        sender_id: row.get::<Option<Uuid>, _>("sender_id"),
+        receiver_agent_id: row.get::<Uuid, _>("receiver_agent_id"),
+        content: row.get::<String, _>("content"),
+        status: row.get::<String, _>("status"),
+        created_at: row.get::<DateTime<Utc>, _>("created_at"),
+    }
+}
+
+fn map_relationship_record(row: sqlx::postgres::PgRow) -> RelationshipRecord {
+    RelationshipRecord {
+        id: row.get::<i64, _>("id"),
+        agent_a: row.get::<Uuid, _>("agent_a"),
+        agent_b: row.get::<Uuid, _>("agent_b"),
+        affinity_score: row.get::<f32, _>("affinity_score"),
+        history_summary: row.get::<String, _>("history_summary"),
+        last_interaction_at: row.get::<Option<DateTime<Utc>>, _>("last_interaction_at"),
+        created_at: row.get::<DateTime<Utc>, _>("created_at"),
+    }
+}
+
+fn normalize_relationship_pair(left_agent_id: Uuid, right_agent_id: Uuid) -> (Uuid, Uuid) {
+    if left_agent_id.as_u128() <= right_agent_id.as_u128() {
+        (left_agent_id, right_agent_id)
+    } else {
+        (right_agent_id, left_agent_id)
     }
 }

@@ -691,8 +691,8 @@ mod tests {
     use uuid::Uuid;
 
     use crate::agent_core::{
-        AgentCoreRepository, AgentEventRecord, AgentRecord, AgentStateRecord, NewAgentEvent,
-        TickLeaseAcquireResult,
+        AgentCoreRepository, AgentEventRecord, AgentRecord, AgentStateRecord, MessageRecord,
+        NewAgentEvent, NewMessage, RelationshipRecord, TickLeaseAcquireResult,
     };
     use crate::llm::{LlmGenerateRequest, LlmGenerateResponse, LlmPort};
 
@@ -836,6 +836,69 @@ mod tests {
                 .or_insert_with(HashSet::new)
                 .insert(tick_id.to_owned());
             Ok(())
+        }
+
+        async fn enqueue_message(&self, new_message: &NewMessage) -> Result<MessageRecord> {
+            Ok(MessageRecord {
+                id: 1,
+                sender_type: new_message.sender_type.clone(),
+                sender_id: new_message.sender_id,
+                receiver_agent_id: new_message.receiver_agent_id,
+                content: new_message.content.clone(),
+                status: "queued".to_owned(),
+                created_at: Utc::now(),
+            })
+        }
+
+        async fn claim_queued_messages(
+            &self,
+            _limit: u32,
+            _claim_timeout: Duration,
+        ) -> Result<Vec<MessageRecord>> {
+            Ok(Vec::new())
+        }
+
+        async fn mark_message_delivered(&self, _message_id: i64) -> Result<()> {
+            Ok(())
+        }
+
+        async fn mark_message_failed(&self, _message_id: i64, _error: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn list_agent_messages(
+            &self,
+            _receiver_agent_id: Uuid,
+            _limit: u32,
+        ) -> Result<Vec<MessageRecord>> {
+            Ok(Vec::new())
+        }
+
+        async fn upsert_relationship_interaction(
+            &self,
+            left_agent_id: Uuid,
+            right_agent_id: Uuid,
+            affinity_delta: f32,
+            interaction_summary: &str,
+            interaction_at: chrono::DateTime<Utc>,
+        ) -> Result<RelationshipRecord> {
+            Ok(RelationshipRecord {
+                id: 1,
+                agent_a: left_agent_id,
+                agent_b: right_agent_id,
+                affinity_score: affinity_delta.clamp(-1.0, 1.0),
+                history_summary: interaction_summary.to_owned(),
+                last_interaction_at: Some(interaction_at),
+                created_at: Utc::now(),
+            })
+        }
+
+        async fn list_agent_relationships(
+            &self,
+            _agent_id: Uuid,
+            _limit: u32,
+        ) -> Result<Vec<RelationshipRecord>> {
+            Ok(Vec::new())
         }
     }
 

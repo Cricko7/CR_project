@@ -13,7 +13,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use sim_backend::agent_core::{
     AgentCoreRepository, AgentEventRecord, AgentTickExecutionStatus, AgentTickOrchestrator,
-    AgentTickOrchestratorOutcome,
+    AgentTickOrchestratorOutcome, MessageRecord, NewMessage, RelationshipRecord,
 };
 use sim_backend::app::config::ApiConfig;
 use sim_backend::app::observability::init_tracing;
@@ -198,6 +198,60 @@ struct RequeueDeadLetterResponse {
 }
 
 #[derive(Deserialize)]
+struct CreateMessageRequest {
+    sender_agent_id: Uuid,
+    content: String,
+}
+
+#[derive(Serialize)]
+struct CreateMessageResponse {
+    message_id: i64,
+    status: String,
+}
+
+#[derive(Deserialize)]
+struct MessageListQuery {
+    limit: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct AgentMessagesResponse {
+    items: Vec<MessageItemResponse>,
+}
+
+#[derive(Serialize)]
+struct MessageItemResponse {
+    id: i64,
+    sender_type: String,
+    sender_id: Option<Uuid>,
+    receiver_agent_id: Uuid,
+    content: String,
+    status: String,
+    created_at: String,
+}
+
+#[derive(Deserialize)]
+struct RelationshipListQuery {
+    limit: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct AgentRelationshipsResponse {
+    items: Vec<RelationshipItemResponse>,
+}
+
+#[derive(Serialize)]
+struct RelationshipItemResponse {
+    id: i64,
+    agent_a: Uuid,
+    agent_b: Uuid,
+    affinity_score: f32,
+    history_summary: String,
+    last_interaction_at: Option<String>,
+    created_at: String,
+}
+
+#[derive(Deserialize)]
 struct WsEventsQuery {
     agent_id: Option<Uuid>,
     snapshot_limit: Option<u32>,
@@ -313,6 +367,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/events", get(list_events))
         .route("/agents/{id}/memories", post(append_agent_memory))
         .route("/agents/{id}/memories/recall", get(recall_agent_memory))
+        .route(
+            "/agents/{id}/messages",
+            post(send_agent_message).get(list_agent_messages),
+        )
+        .route("/agents/{id}/relationships", get(list_agent_relationships))
         .route(
             "/agents/{id}/memories/summarize",
             post(summarize_agent_memory),
@@ -568,6 +627,143 @@ async fn append_agent_memory(
     ))
 }
 
+async fn send_agent_message(
+    State(state): State<ApiState>,
+    Path(receiver_agent_id): Path<Uuid>,
+    Json(payload): Json<CreateMessageRequest>,
+) -> Result<(StatusCode, Json<CreateMessageResponse>), (StatusCode, Json<ApiErrorResponse>)> {
+    if payload.content.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorResponse {
+                error: "invalid_content",
+                message: "message content must not be empty".to_owned(),
+            }),
+        ));
+    }
+    if payload.sender_agent_id == receiver_agent_id {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorResponse {
+                error: "invalid_sender",
+                message: "sender and receiver must be different agents".to_owned(),
+            }),
+        ));
+    }
+
+    let sender_exists = state
+        .repository
+        .get_agent(payload.sender_agent_id)
+        .await
+        .map_err(|error| {
+            internal_error(
+                "message_send_failed",
+                format!("failed to load sender agent: {error}"),
+            )
+        })?
+        .is_some();
+    if !sender_exists {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiErrorResponse {
+                error: "sender_not_found",
+                message: format!("sender agent `{}` does not exist", payload.sender_agent_id),
+            }),
+        ));
+    }
+
+    let receiver_exists = state
+        .repository
+        .get_agent(receiver_agent_id)
+        .await
+        .map_err(|error| {
+            internal_error(
+                "message_send_failed",
+                format!("failed to load receiver agent: {error}"),
+            )
+        })?
+        .is_some();
+    if !receiver_exists {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiErrorResponse {
+                error: "receiver_not_found",
+                message: format!("receiver agent `{}` does not exist", receiver_agent_id),
+            }),
+        ));
+    }
+
+    let message = state
+        .repository
+        .enqueue_message(&NewMessage {
+            sender_type: "agent".to_owned(),
+            sender_id: Some(payload.sender_agent_id),
+            receiver_agent_id,
+            content: payload.content.trim().to_owned(),
+        })
+        .await
+        .map_err(|error| {
+            internal_error(
+                "message_send_failed",
+                format!("failed to enqueue agent message: {error}"),
+            )
+        })?;
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(CreateMessageResponse {
+            message_id: message.id,
+            status: message.status,
+        }),
+    ))
+}
+
+async fn list_agent_messages(
+    State(state): State<ApiState>,
+    Path(agent_id): Path<Uuid>,
+    Query(query): Query<MessageListQuery>,
+) -> Result<Json<AgentMessagesResponse>, (StatusCode, Json<ApiErrorResponse>)> {
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let items = state
+        .repository
+        .list_agent_messages(agent_id, limit)
+        .await
+        .map_err(|error| {
+            internal_error(
+                "message_list_failed",
+                format!("failed to list agent messages: {error}"),
+            )
+        })?
+        .into_iter()
+        .map(map_message_record)
+        .collect();
+
+    Ok(Json(AgentMessagesResponse { items }))
+}
+
+async fn list_agent_relationships(
+    State(state): State<ApiState>,
+    Path(agent_id): Path<Uuid>,
+    Query(query): Query<RelationshipListQuery>,
+) -> Result<Json<AgentRelationshipsResponse>, (StatusCode, Json<ApiErrorResponse>)> {
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let items = state
+        .repository
+        .list_agent_relationships(agent_id, limit)
+        .await
+        .map_err(|error| {
+            internal_error(
+                "relationship_list_failed",
+                format!("failed to list agent relationships: {error}"),
+            )
+        })?
+        .into_iter()
+        .map(map_relationship_record)
+        .collect();
+
+    Ok(Json(AgentRelationshipsResponse { items }))
+}
+
 async fn recall_agent_memory(
     State(state): State<ApiState>,
     Path(agent_id): Path<Uuid>,
@@ -815,6 +1011,30 @@ fn map_dead_letter_memory(memory: MemoryEntryRecord) -> DeadLetterEmbeddingItemR
         importance: memory.importance,
         created_at: memory.created_at.to_rfc3339(),
         embedding_status: memory.embedding_status,
+    }
+}
+
+fn map_message_record(message: MessageRecord) -> MessageItemResponse {
+    MessageItemResponse {
+        id: message.id,
+        sender_type: message.sender_type,
+        sender_id: message.sender_id,
+        receiver_agent_id: message.receiver_agent_id,
+        content: message.content,
+        status: message.status,
+        created_at: message.created_at.to_rfc3339(),
+    }
+}
+
+fn map_relationship_record(record: RelationshipRecord) -> RelationshipItemResponse {
+    RelationshipItemResponse {
+        id: record.id,
+        agent_a: record.agent_a,
+        agent_b: record.agent_b,
+        affinity_score: record.affinity_score,
+        history_summary: record.history_summary,
+        last_interaction_at: record.last_interaction_at.map(|value| value.to_rfc3339()),
+        created_at: record.created_at.to_rfc3339(),
     }
 }
 

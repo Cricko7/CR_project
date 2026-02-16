@@ -23,13 +23,13 @@ Backend для симуляции мира автономных AI-агенто�
 | 1. Долговременная память (vector DB + summarization) | `FULLY IMPLEMENTED` | Реализованы `memory_entries`, embedding pipeline с retry+DLQ, Qdrant recall, архивирование старых воспоминаний, авто-суммаризация overflow, API для dead-letter requeue |
 | 2. Эмоциональный интеллект | `FULLY IMPLEMENTED` | Реализована динамика эмоций на каждом тике (summary + personality traits -> valence/arousal/mood), а также периодический mood decay к нейтрали в worker |
 | 3. Архитектура агента (рефлексия→цель→действие) | `FULLY IMPLEMENTED` | Tick pipeline декомпозирован на 4 стадии: reflection, goal selection, action planning, execution + side effects; результат и stage-trace пишутся в event payload |
-| 4. Мультиагентность (общение, отношения) | `PARTIAL` | Таблицы `messages`, `relationships` есть; процессинг межагентных сообщений/обновления отношений пока не поднят |
+| 4. Мультиагентность (общение, отношения) | `FULLY IMPLEMENTED` | Реализованы API отправки/чтения сообщений, worker delivery lifecycle (`queued -> processing -> delivered/failed`) и автоматическое обновление `relationships` (affinity + history) при доставке |
 | 5. Real-time dashboard life feed | `PARTIAL` | Есть `/events` + `/ws/events`; живой WS-пуш пока только для тиков, инициированных через API |
-| 6. Граф отношений | `NOT STARTED` | Модель таблицы есть, API/агрегации/стримов отношений нет |
+| 6. Граф отношений | `PARTIAL` | Есть базовый API списка отношений и обновление affinity/history от сообщений; нет graph-агрегаций и live graph stream |
 | 7. Inspector агента | `PARTIAL` | Есть `/agents/{id}/state`, memory recall; агрегированного "профиля агента" endpoint пока нет |
 | 8. Панель вмешательства | `PARTIAL` | Есть endpoint ручного тика и memory append; отдельные intervention endpoints пока не готовы |
 | Доп. фича 1: настроение влияет на стиль речи | `PARTIAL` | Mood передается в prompt, но полноценные style policies не оформлены |
-| Доп. фича 2: страница агента с историей отношений | `NOT STARTED` | Нужен frontend + API для отношений и timeline |
+| Доп. фича 2: страница агента с историей отношений | `PARTIAL` | Backend API для отношений есть; нужен frontend-экран и timeline-агрегации |
 
 ---
 
@@ -116,7 +116,9 @@ flowchart LR
 
 ### Communication
 - Текущее состояние:
-  - есть `messages` таблица, но нет полноценного message bus/consumer flow.
+  - есть enqueue/list API для межагентных сообщений;
+  - worker delivery loop обрабатывает очередь сообщений и пишет delivery events;
+  - при доставке сообщения обновляется relationship score/history между агентами.
 
 ### Emotions
 - Текущее состояние:
@@ -174,7 +176,8 @@ CR_project/
 │       │   ├── 0001_initial_schema.sql
 │       │   ├── 0002_memory_long_term.sql
 │       │   ├── 0003_concurrency_failure_modes.sql
-│       │   └── 0004_memory_embedding_retry_dlq.sql
+│       │   ├── 0004_memory_embedding_retry_dlq.sql
+│       │   └── 0005_multyagent_communication.sql
 │       └── src/
 │           ├── app/                # config, runtime, observability
 │           ├── agent_core/         # orchestrator, persistence traits, tick runner
@@ -238,6 +241,16 @@ CR_project/
 Ограничение:
 - live WS сейчас публикуется только для тиков, инициированных в API процессе.
 - события, созданные worker-ом, в тот же момент через WS не пушатся (видны через snapshot/polling).
+
+### 7.5 Message/relationship flow
+1. API `POST /agents/{receiver_id}/messages` добавляет запись в `messages` со статусом `queued`.
+2. Worker `message_delivery_worker` claim'ит queued batch (`FOR UPDATE SKIP LOCKED`) и переводит в `processing`.
+3. Для каждой записи:
+   - пишется event `agent.message.received` для receiver;
+   - обновляется `relationships` (upsert pair + affinity delta + history append).
+4. Delivery статус:
+   - success -> `delivered`;
+   - failure -> `failed` + `delivery_error`.
 
 ---
 
@@ -338,7 +351,69 @@ Response:
 }
 ```
 
-### 8.5 Memory append
+### 8.5 Agent message send
+
+#### `POST /agents/{receiver_id}/messages`
+
+Request:
+```json
+{
+  "sender_agent_id": "uuid",
+  "content": "Let's cooperate on exploring the market."
+}
+```
+
+Response (`202`):
+```json
+{
+  "message_id": 77,
+  "status": "queued"
+}
+```
+
+### 8.6 Agent messages list
+
+#### `GET /agents/{id}/messages?limit=<1..200>`
+
+Response:
+```json
+{
+  "items": [
+    {
+      "id": 77,
+      "sender_type": "agent",
+      "sender_id": "uuid",
+      "receiver_agent_id": "uuid",
+      "content": "Let's cooperate on exploring the market.",
+      "status": "delivered",
+      "created_at": "2026-02-16T12:00:00Z"
+    }
+  ]
+}
+```
+
+### 8.7 Agent relationships
+
+#### `GET /agents/{id}/relationships?limit=<1..200>`
+
+Response:
+```json
+{
+  "items": [
+    {
+      "id": 5,
+      "agent_a": "uuid-a",
+      "agent_b": "uuid-b",
+      "affinity_score": 0.32,
+      "history_summary": "Let's cooperate on exploring the market.",
+      "last_interaction_at": "2026-02-16T12:00:01Z",
+      "created_at": "2026-02-16T12:00:01Z"
+    }
+  ]
+}
+```
+
+### 8.8 Memory append
 
 #### `POST /agents/{id}/memories`
 
@@ -358,7 +433,7 @@ Response (`201`):
 }
 ```
 
-### 8.6 Memory recall
+### 8.9 Memory recall
 
 #### `GET /agents/{id}/memories/recall?query=...&top_k=8`
 
@@ -378,7 +453,7 @@ Response:
 }
 ```
 
-### 8.7 Manual summarization
+### 8.10 Manual summarization
 
 #### `POST /agents/{id}/memories/summarize`
 
@@ -399,7 +474,7 @@ Response:
 }
 ```
 
-### 8.8 Manual embedding processing
+### 8.11 Manual embedding processing
 
 #### `POST /memory/process-embeddings`
 
@@ -421,7 +496,7 @@ Response:
 }
 ```
 
-### 8.9 Dead-letter embeddings
+### 8.12 Dead-letter embeddings
 
 #### `GET /memory/dead-letter?limit=<1..200>`
 
@@ -452,7 +527,7 @@ Response:
 }
 ```
 
-### 8.10 WebSocket events
+### 8.13 WebSocket events
 
 #### `GET /ws/events?agent_id=<uuid>&snapshot_limit=<1..200>`
 
@@ -490,14 +565,15 @@ Examples:
 - `crates/sim-backend/migrations/0002_memory_long_term.sql`
 - `crates/sim-backend/migrations/0003_concurrency_failure_modes.sql`
 - `crates/sim-backend/migrations/0004_memory_embedding_retry_dlq.sql`
+- `crates/sim-backend/migrations/0005_multyagent_communication.sql`
 
 Основные таблицы:
 - `agents`: карточка агента, personality JSON.
 - `agent_states`: valence/arousal/mood.
 - `events`: доменные события.
 - `memory_entries`: эпизодическая и summary память.
-- `relationships`: каркас для affinity.
-- `messages`: каркас межагентных/пользовательских сообщений.
+- `relationships`: affinity/history между агентами, обновляется из message delivery.
+- `messages`: очередь межагентных сообщений + delivery status machine.
 - `interventions`: каркас админ-вмешательств.
 - `outbox_events`: каркас event publication.
 
@@ -595,6 +671,8 @@ Payload в point:
 | `WORKER_TICK_CONCURRENCY` | `8` |
 | `WORKER_MOOD_DECAY_INTERVAL_MS` | `5000` |
 | `WORKER_MOOD_DECAY_STEP` | `0.06` |
+| `WORKER_MESSAGE_INTERVAL_MS` | `1000` |
+| `WORKER_MESSAGE_BATCH_SIZE` | `32` |
 
 ---
 
@@ -627,6 +705,8 @@ set API_PORT=8080
 set WORKER_AGENT_IDS=<uuid1>,<uuid2>
 set WORKER_TICK_CONCURRENCY=8
 set WORKER_MOOD_DECAY_STEP=0.06
+set WORKER_MESSAGE_INTERVAL_MS=1000
+set WORKER_MESSAGE_BATCH_SIZE=32
 set GEMINI_API_KEY=<your_google_api_key>
 ```
 
@@ -687,7 +767,7 @@ VALUES
 
 ### Ключевые дыры/риски
 1. **Нет аутентификации/авторизации** API и WS.
-2. **Нет rate limiting** на дорогие endpoint'ы (`/ticks`, `/memories/*`, `/process-embeddings`).
+2. **Нет rate limiting** на дорогие endpoint'ы (`/ticks`, `/messages/*`, `/memories/*`, `/process-embeddings`).
 3. **Нет tenant isolation** (single-world assumptions).
 4. **In-memory WS hub** не защищен и не масштабируется межинстансно.
 5. **Нет секрет-менеджмента** (Vault/KMS), только env vars.
@@ -746,10 +826,10 @@ VALUES
    - vector recall;
    - overflow summarization.
 7. Qdrant adapter и Gemini adapters.
-8. REST endpoints для state/events/memory/ticks.
+8. REST endpoints для state/events/memory/ticks/messages/relationships.
 9. WebSocket endpoint с snapshot + live events.
-10. Worker циклы: ticks, mood-decay, embedding, summarization.
-11. Миграции для базовой схемы, long-term memory и concurrency/failure hardening.
+10. Worker циклы: ticks, mood-decay, message delivery, embedding, summarization.
+11. Миграции для базовой схемы, long-term memory, concurrency/failure hardening и мультиагентной коммуникации.
 12. Unit tests для `agent_core` и `memory`.
 
 ---
@@ -764,7 +844,7 @@ VALUES
    - relationships graph;
    - interventions (add event, send message);
    - agent inspector aggregate endpoint.
-3. Поднять event bus для межагентных сообщений (Redis Streams/NATS) либо простой DB outbox + worker-consumer.
+3. Расширить message pipeline до гарантированной доставки (retry/DLQ/ack semantics на уровне сообщений).
 4. Сделать live updates для worker-событий в WS через общий pub/sub, а не process-local hub.
 5. Доработать policy-слой эмоционального интеллекта (domain-specific rules per world/agent class).
 
@@ -774,8 +854,7 @@ VALUES
    - affinity update rules;
    - decay/recovery;
    - summary regeneration.
-3. Реализовать message delivery lifecycle:
-   - queued -> delivered -> acknowledged/failed.
+3. Добавить acknowledgment этап в message lifecycle (сейчас: queued -> processing -> delivered/failed).
 4. Реализовать snapshot endpoints для frontend dashboard.
 
 ### P2 (hardening)
@@ -809,6 +888,7 @@ VALUES
    - `migrations/0002_memory_long_term.sql`
    - `migrations/0003_concurrency_failure_modes.sql`
    - `migrations/0004_memory_embedding_retry_dlq.sql`
+   - `migrations/0005_multyagent_communication.sql`
 5. Проверь текущий контракт API:
    - все endpoints в `crates/api/src/main.rs`.
 6. Проверь поведение конкуррентности:
@@ -821,6 +901,8 @@ VALUES
 - mood обновляется на тике через summary+personality model и постепенно затухает к нейтрали в mood-decay worker;
 - duplicate/busy tick защита есть и process-local, и cross-process через Postgres lease/idempotency;
 - `embedding_status` цикл: `pending -> processing -> embedded | pending(retry) | dead_letter`.
+- `messages.status` цикл: `queued -> processing -> delivered | failed`;
+- relationship pair хранится уникально (`agent_a`, `agent_b`), affinity обновляется при доставке сообщений.
 
 Что менять осторожно:
 - формат payload в `events` (его читает UI/аналитика);

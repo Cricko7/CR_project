@@ -7,7 +7,7 @@ pub use orchestrator::{
     AgentTickOrchestratorOutcome,
 };
 pub use persistence::{
-    AgentCoreRepository, AgentEventRecord, AgentRecord, AgentStateRecord, NewAgentEvent,
-    TickLeaseAcquireResult,
+    AgentCoreRepository, AgentEventRecord, AgentRecord, AgentStateRecord, MessageRecord,
+    NewAgentEvent, NewMessage, RelationshipRecord, TickLeaseAcquireResult,
 };
 pub use tick_runner::{AgentTickRunner, TickRunOutcome};
