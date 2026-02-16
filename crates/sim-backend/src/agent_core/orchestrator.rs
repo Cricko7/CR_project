@@ -16,6 +16,7 @@ use crate::llm::{LlmGenerateRequest, LlmPort};
 const DEFAULT_TICK_HISTORY_PER_AGENT: usize = 256;
 const DEFAULT_TICK_LEASE_TTL: Duration = Duration::from_secs(90);
 const LLM_SUMMARY_MAX_CHARS: usize = 512;
+const PIPELINE_STAGE_MAX_CHARS: usize = 320;
 const EVENT_DESCRIPTION_MAX_CHARS: usize = 180;
 const EMOTION_INERTIA_VALENCE: f32 = 0.72;
 const EMOTION_INERTIA_AROUSAL: f32 = 0.68;
@@ -44,6 +45,117 @@ pub enum AgentTickOrchestratorOutcome {
     Executed(AgentTickExecutionResult),
     SkippedBusy,
     SkippedDuplicate,
+}
+
+#[derive(Debug, Clone)]
+struct DecisionStageOutput {
+    text: String,
+    used_llm: bool,
+    model: Option<String>,
+    error: Option<String>,
+    latency_ms: Option<u128>,
+}
+
+impl DecisionStageOutput {
+    fn to_llm_json(&self) -> Value {
+        json!({
+            "used": self.used_llm,
+            "model": self.model,
+            "error": self.error,
+            "latency_ms": self.latency_ms,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AgentDecisionPipeline {
+    reflection: DecisionStageOutput,
+    goal: DecisionStageOutput,
+    action_plan: DecisionStageOutput,
+    execution: DecisionStageOutput,
+}
+
+impl AgentDecisionPipeline {
+    fn action_summary(&self) -> String {
+        self.execution.text.clone()
+    }
+
+    fn used_llm(&self) -> bool {
+        self.reflection.used_llm
+            || self.goal.used_llm
+            || self.action_plan.used_llm
+            || self.execution.used_llm
+    }
+
+    fn first_model(&self) -> Option<String> {
+        for stage in [
+            &self.reflection,
+            &self.goal,
+            &self.action_plan,
+            &self.execution,
+        ] {
+            if let Some(model) = &stage.model {
+                return Some(model.clone());
+            }
+        }
+        None
+    }
+
+    fn first_error(&self) -> Option<String> {
+        for stage in [
+            &self.reflection,
+            &self.goal,
+            &self.action_plan,
+            &self.execution,
+        ] {
+            if let Some(error) = &stage.error {
+                return Some(error.clone());
+            }
+        }
+        None
+    }
+
+    fn total_latency_ms(&self) -> Option<u128> {
+        let mut total = 0u128;
+        let mut has_latency = false;
+        for stage in [
+            &self.reflection,
+            &self.goal,
+            &self.action_plan,
+            &self.execution,
+        ] {
+            if let Some(value) = stage.latency_ms {
+                total = total.saturating_add(value);
+                has_latency = true;
+            }
+        }
+        if has_latency { Some(total) } else { None }
+    }
+
+    fn decision_json(&self) -> Value {
+        json!({
+            "reflection": self.reflection.text,
+            "goal": self.goal.text,
+            "action_plan": self.action_plan.text,
+            "execution": self.execution.text,
+        })
+    }
+
+    fn llm_json(&self, configured: bool) -> Value {
+        json!({
+            "configured": configured,
+            "used": self.used_llm(),
+            "model": self.first_model(),
+            "error": self.first_error(),
+            "latency_ms": self.total_latency_ms(),
+            "stages": {
+                "reflection": self.reflection.to_llm_json(),
+                "goal": self.goal.to_llm_json(),
+                "action_plan": self.action_plan.to_llm_json(),
+                "execution": self.execution.to_llm_json(),
+            }
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -182,7 +294,7 @@ async fn execute_tick(
         None => (0.0, 0.0, "neutral".to_owned()),
     };
 
-    let (action_summary, llm_used, llm_model, llm_error, llm_latency_ms) = generate_action_summary(
+    let decision_pipeline = run_decision_pipeline(
         llm.as_deref(),
         &agent.name,
         &agent.personality_json,
@@ -192,6 +304,7 @@ async fn execute_tick(
         previous_arousal,
     )
     .await;
+    let action_summary = decision_pipeline.action_summary();
 
     let (next_valence, next_arousal, next_mood) = evolve_emotional_state(
         previous_valence,
@@ -228,6 +341,7 @@ async fn execute_tick(
                 "mood_label": next_mood,
                 "valence": next_valence,
                 "arousal": next_arousal,
+                "decision_pipeline": decision_pipeline.decision_json(),
                 "emotion": {
                     "previous": {
                         "mood_label": previous_mood,
@@ -245,13 +359,7 @@ async fn execute_tick(
                     }
                 },
                 "action_summary": action_summary,
-                "llm": {
-                    "configured": llm.is_some(),
-                    "used": llm_used,
-                    "model": llm_model,
-                    "error": llm_error,
-                    "latency_ms": llm_latency_ms,
-                }
+                "llm": decision_pipeline.llm_json(llm.is_some())
             }),
         })
         .await?;
@@ -268,7 +376,7 @@ async fn execute_tick(
     })
 }
 
-async fn generate_action_summary(
+async fn run_decision_pipeline(
     llm: Option<&dyn LlmPort>,
     agent_name: &str,
     personality_json: &Value,
@@ -276,72 +384,139 @@ async fn generate_action_summary(
     mood_label: &str,
     valence: f32,
     arousal: f32,
-) -> (String, bool, Option<String>, Option<String>, Option<u128>) {
-    let fallback = fallback_summary(agent_name, mood_label);
+) -> AgentDecisionPipeline {
+    let reflection_fallback =
+        format!("{agent_name} reflects on the current world state and their {mood_label} mood.");
+    let reflection = generate_pipeline_stage(
+        llm,
+        "reflection",
+        Some(format!(
+            "You are the reflection stage of autonomous agent `{agent_name}`. Personality JSON: {personality_json}. Return one concise sentence."
+        )),
+        format!(
+            "Tick {tick_id}. Mood: {mood_label}. Valence: {valence:.2}. Arousal: {arousal:.2}. Write a brief self-reflection."
+        ),
+        reflection_fallback,
+        PIPELINE_STAGE_MAX_CHARS,
+    )
+    .await;
 
+    let goal_fallback =
+        format!("{agent_name} sets a short-term goal to improve social stability and progress.");
+    let goal = generate_pipeline_stage(
+        llm,
+        "goal_selection",
+        Some(format!(
+            "You are the goal-selection stage for agent `{agent_name}`. Return one concrete goal sentence."
+        )),
+        format!(
+            "Tick {tick_id}. Reflection: {}. Mood: {mood_label}. Choose one immediate goal.",
+            reflection.text
+        ),
+        goal_fallback,
+        PIPELINE_STAGE_MAX_CHARS,
+    )
+    .await;
+
+    let action_plan_fallback = format!(
+        "{agent_name} plans a concrete action: contact a nearby agent, exchange context, and adapt."
+    );
+    let action_plan = generate_pipeline_stage(
+        llm,
+        "action_planning",
+        Some(format!(
+            "You are the action-planning stage for agent `{agent_name}`. Return one concrete immediate plan."
+        )),
+        format!(
+            "Tick {tick_id}. Reflection: {}. Goal: {}. Produce an immediate action plan.",
+            reflection.text, goal.text
+        ),
+        action_plan_fallback,
+        PIPELINE_STAGE_MAX_CHARS,
+    )
+    .await;
+
+    let execution_fallback = fallback_execution_summary(agent_name, mood_label, &action_plan.text);
+    let execution = generate_pipeline_stage(
+        llm,
+        "execution",
+        Some(format!(
+            "You are the execution stage for agent `{agent_name}`. Simulate execution result in 1-2 short sentences."
+        )),
+        format!(
+            "Tick {tick_id}. Goal: {}. Plan: {}. Mood: {mood_label}. Return execution result and immediate side-effect.",
+            goal.text, action_plan.text
+        ),
+        execution_fallback,
+        LLM_SUMMARY_MAX_CHARS,
+    )
+    .await;
+
+    AgentDecisionPipeline {
+        reflection,
+        goal,
+        action_plan,
+        execution,
+    }
+}
+
+async fn generate_pipeline_stage(
+    llm: Option<&dyn LlmPort>,
+    stage_name: &'static str,
+    system_prompt: Option<String>,
+    user_prompt: String,
+    fallback: String,
+    max_chars: usize,
+) -> DecisionStageOutput {
     let Some(llm) = llm else {
-        return (
-            fallback,
-            false,
-            None,
-            Some("llm_not_configured".to_owned()),
-            None,
-        );
+        return DecisionStageOutput {
+            text: fallback,
+            used_llm: false,
+            model: None,
+            error: Some("llm_not_configured".to_owned()),
+            latency_ms: None,
+        };
     };
 
     let request = LlmGenerateRequest {
-        system_prompt: Some(format!(
-            "You are a planning core for autonomous AI agent `{agent_name}`. Personality JSON: {personality_json}. Return only 1-2 concise sentences: reflection and immediate next action."
-        )),
-        user_prompt: format!(
-            "Tick: {tick_id}. Mood: {mood_label}. Valence: {valence:.2}. Arousal: {arousal:.2}. Generate reflection + next action."
-        ),
-        temperature: Some(0.5),
-        max_output_tokens: Some(96),
+        system_prompt,
+        user_prompt,
+        temperature: Some(0.4),
+        max_output_tokens: Some(120),
     };
 
     let started_at = Instant::now();
     match llm.generate(request).await {
-        Ok(response) => {
-            let latency_ms = started_at.elapsed().as_millis();
-            tracing::info!(
-                agent_name,
-                tick_id,
-                model = %response.model,
-                latency_ms,
-                "llm summary generated for agent tick"
-            );
-            (
-                trim_text(&response.text, LLM_SUMMARY_MAX_CHARS),
-                true,
-                Some(response.model),
-                None,
-                Some(latency_ms),
-            )
-        }
+        Ok(response) => DecisionStageOutput {
+            text: trim_text(&response.text, max_chars),
+            used_llm: true,
+            model: Some(response.model),
+            error: None,
+            latency_ms: Some(started_at.elapsed().as_millis()),
+        },
         Err(error) => {
             let latency_ms = started_at.elapsed().as_millis();
             tracing::warn!(
-                agent_name,
-                tick_id,
+                stage = stage_name,
                 latency_ms,
                 error = %error,
-                "llm failed during agent tick, using deterministic fallback"
+                "llm stage failed, using deterministic fallback"
             );
-            (
-                fallback,
-                false,
-                None,
-                Some(error.to_string()),
-                Some(latency_ms),
-            )
+            DecisionStageOutput {
+                text: fallback,
+                used_llm: false,
+                model: None,
+                error: Some(error.to_string()),
+                latency_ms: Some(latency_ms),
+            }
         }
     }
 }
 
-fn fallback_summary(agent_name: &str, mood_label: &str) -> String {
+fn fallback_execution_summary(agent_name: &str, mood_label: &str, action_plan: &str) -> String {
     format!(
-        "{agent_name} stays {mood_label} and continues a routine social action in the environment."
+        "{agent_name} ({mood_label}) executes plan: {}",
+        trim_text(action_plan, EVENT_DESCRIPTION_MAX_CHARS)
     )
 }
 
@@ -790,12 +965,22 @@ mod tests {
             .expect("tick should execute");
 
         assert!(matches!(outcome, AgentTickOrchestratorOutcome::Executed(_)));
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
 
         let events = repository.events.lock().await;
         let event = events.last().expect("event should exist");
         assert_eq!(event.payload_json["llm"]["used"], true);
         assert_eq!(event.payload_json["llm"]["model"], "stub-model");
+        assert!(
+            event.payload_json["decision_pipeline"]["reflection"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Plans a cooperative conversation")
+        );
+        assert_eq!(
+            event.payload_json["llm"]["stages"]["execution"]["used"],
+            true
+        );
         assert_eq!(
             event.payload_json["action_summary"],
             "Plans a cooperative conversation."
@@ -820,7 +1005,7 @@ mod tests {
             .expect("tick should execute");
 
         assert!(matches!(outcome, AgentTickOrchestratorOutcome::Executed(_)));
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
 
         let events = repository.events.lock().await;
         let event = events.last().expect("event should exist");

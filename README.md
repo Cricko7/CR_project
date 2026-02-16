@@ -22,7 +22,7 @@ Backend для симуляции мира автономных AI-агенто�
 |---|---|---|
 | 1. Долговременная память (vector DB + summarization) | `FULLY IMPLEMENTED` | Реализованы `memory_entries`, embedding pipeline с retry+DLQ, Qdrant recall, архивирование старых воспоминаний, авто-суммаризация overflow, API для dead-letter requeue |
 | 2. Эмоциональный интеллект | `FULLY IMPLEMENTED` | Реализована динамика эмоций на каждом тике (summary + personality traits -> valence/arousal/mood), а также периодический mood decay к нейтрали в worker |
-| 3. Архитектура агента (рефлексия→цель→действие) | `PARTIAL` | Есть tick orchestrator + LLM summary, но отдельные стадии планирования пока не декомпозированы |
+| 3. Архитектура агента (рефлексия→цель→действие) | `FULLY IMPLEMENTED` | Tick pipeline декомпозирован на 4 стадии: reflection, goal selection, action planning, execution + side effects; результат и stage-trace пишутся в event payload |
 | 4. Мультиагентность (общение, отношения) | `PARTIAL` | Таблицы `messages`, `relationships` есть; процессинг межагентных сообщений/обновления отношений пока не поднят |
 | 5. Real-time dashboard life feed | `PARTIAL` | Есть `/events` + `/ws/events`; живой WS-пуш пока только для тиков, инициированных через API |
 | 6. Граф отношений | `NOT STARTED` | Модель таблицы есть, API/агрегации/стримов отношений нет |
@@ -102,8 +102,9 @@ flowchart LR
 - Ответственность:
   - выполнение agent tick;
   - dedup/busy protection на процесс;
+  - staged decision pipeline: reflection -> goal -> action_plan -> execution;
   - запись `agent_states` и `events`;
-  - LLM-driven action summary с fallback.
+  - LLM-driven stage outputs с per-stage fallback.
 
 ### Memory
 - Файлы: `crates/sim-backend/src/memory/*`
@@ -198,7 +199,11 @@ CR_project/
    - concurrent tick для одного агента в пределах одного процесса.
 4. Orchestrator:
    - читает agent + state;
-   - генерирует action summary (Gemini или fallback);
+   - прогоняет decision pipeline по стадиям:
+     - reflection;
+     - goal selection;
+     - action planning;
+     - execution + side effects;
    - пересчитывает `valence/arousal/mood_label` на основе summary и personality traits;
    - upsert state;
    - пишет event в `events`.
@@ -733,7 +738,7 @@ VALUES
 1. Базовый runtime и graceful shutdown.
 2. Structured logging.
 3. Конфигурирование через env с валидацией.
-4. Agent tick orchestrator + LLM summary.
+4. Agent tick orchestrator со staged decision pipeline (reflection -> goal -> action_plan -> execution).
 5. Постгрес-репозиторий для agent core.
 6. Memory service:
    - append;
@@ -764,11 +769,7 @@ VALUES
 5. Доработать policy-слой эмоционального интеллекта (domain-specific rules per world/agent class).
 
 ### P1 (нужно для полноты симуляции)
-1. Разделить tick pipeline на этапы:
-   - reflection;
-   - goal selection;
-   - action planning;
-   - execution + side effects.
+1. Добавить policy-конфиг для stage pipeline (пер-агентные ограничения/приоритеты целей).
 2. Реализовать relationship engine:
    - affinity update rules;
    - decay/recovery;
