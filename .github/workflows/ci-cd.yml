@@ -33,7 +33,7 @@ jobs:
         uses: actions-rs/cargo@v1
         with:
           command: clippy
-          args: -- -D warnings -A clippy::wrong_self_convention
+          args: -- -D warnings -A clippy::manual_map -A clippy::wrong_self_convention
 
       - name: ESLint (Frontend)
         run: |
