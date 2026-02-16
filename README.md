@@ -197,6 +197,30 @@ CR_project/
 │           ├── infrastructure/     # postgres, qdrant, gemini adapters
 │           ├── llm/                # LLM port
 │           └── lib.rs
+|
+├── frontend/
+│   ├── Dockerfile
+│   ├── nginx.conf
+│   ├── package.json
+│   ├── tailwind.config.js
+│   ├── tsconfig.json
+│   ├── vite.config.ts
+│   ├── index.html
+│   ├── public/
+│   │   └── favicon.ico
+│   └── src/
+│       ├── index.css
+│       ├── main.tsx
+│       ├── App.tsx
+│       ├── types/api.ts
+│       ├── hooks/useCyberLife.ts
+│       └── components/
+│           ├── Dashboard.tsx
+│           ├── AgentCard.tsx
+│           ├── AgentInspector.tsx
+│           ├── Graph.tsx
+│           └── InterventionPanel.tsx
+|
 └── README.md
 ```
 

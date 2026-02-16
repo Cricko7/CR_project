@@ -113,6 +113,21 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
 
+  
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: cr-cyberlife-frontend:local
+    container_name: cr-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      VITE_API_URL: "http://localhost:8080"
+    depends_on:
+      - api
+    restart: unless-stopped
+
 volumes:
   postgres_data:
   qdrant_data:
