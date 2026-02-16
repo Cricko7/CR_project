@@ -1,11 +1,18 @@
-use anyhow::{Context, Result};
+use std::time::Duration;
+
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::Row;
 use sqlx::postgres::PgPool;
 use uuid::Uuid;
 
-use crate::memory::{MemoryEntryRecord, MemoryRepository, NewMemoryEntry};
+use crate::memory::{
+    EmbeddingFailureDisposition, MemoryEntryRecord, MemoryRepository, NewMemoryEntry,
+};
+
+const EMBEDDING_MAX_ATTEMPTS: i32 = 5;
+const EMBEDDING_RETRY_BACKOFF_MS: i64 = 5_000;
 
 #[derive(Clone)]
 pub struct PostgresMemoryRepository {
@@ -40,20 +47,48 @@ impl MemoryRepository for PostgresMemoryRepository {
         Ok(map_memory_entry(row))
     }
 
-    async fn list_pending_embeddings(&self, limit: u32) -> Result<Vec<MemoryEntryRecord>> {
+    async fn claim_pending_embeddings(
+        &self,
+        limit: u32,
+        claim_timeout: Duration,
+    ) -> Result<Vec<MemoryEntryRecord>> {
+        let timeout_ms = i64::try_from(claim_timeout.as_millis())
+            .unwrap_or(i64::MAX)
+            .max(1);
         let rows = sqlx::query(
             r#"
-            SELECT id, agent_id, content, summary, importance, is_summary, archived, embedding_status, created_at
-            FROM memory_entries
-            WHERE embedding_status = 'pending'
-            ORDER BY created_at ASC
-            LIMIT $1
+            WITH claimed AS (
+                SELECT id
+                FROM memory_entries
+                WHERE
+                    (
+                        embedding_status = 'pending'
+                        AND embedding_next_retry_at <= NOW()
+                    )
+                    OR (
+                        embedding_status = 'processing'
+                        AND embedding_claimed_at IS NOT NULL
+                        AND embedding_claimed_at <= NOW() - ($2 * INTERVAL '1 millisecond')
+                    )
+                ORDER BY created_at ASC
+                LIMIT $1
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE memory_entries AS memory
+            SET embedding_status = 'processing',
+                embedding_claimed_at = NOW(),
+                embedding_error = NULL
+            FROM claimed
+            WHERE memory.id = claimed.id
+            RETURNING memory.id, memory.agent_id, memory.content, memory.summary, memory.importance,
+                      memory.is_summary, memory.archived, memory.embedding_status, memory.created_at
             "#,
         )
         .bind(i64::from(limit))
+        .bind(timeout_ms)
         .fetch_all(&self.pool)
         .await
-        .context("failed to list pending memory embeddings")?;
+        .context("failed to claim pending memory embeddings")?;
 
         Ok(rows.into_iter().map(map_memory_entry).collect())
     }
@@ -62,7 +97,11 @@ impl MemoryRepository for PostgresMemoryRepository {
         sqlx::query(
             r#"
             UPDATE memory_entries
-            SET embedding_status = 'embedded', embedding_model = $2, embedding_error = NULL
+            SET embedding_status = 'embedded',
+                embedding_model = $2,
+                embedding_error = NULL,
+                embedding_claimed_at = NULL,
+                embedding_next_retry_at = NOW()
             WHERE id = $1
             "#,
         )
@@ -74,20 +113,90 @@ impl MemoryRepository for PostgresMemoryRepository {
         Ok(())
     }
 
-    async fn mark_embedding_failed(&self, memory_id: i64, error: &str) -> Result<()> {
-        sqlx::query(
+    async fn mark_embedding_failed(
+        &self,
+        memory_id: i64,
+        error: &str,
+    ) -> Result<EmbeddingFailureDisposition> {
+        let row = sqlx::query(
             r#"
             UPDATE memory_entries
-            SET embedding_status = 'failed', embedding_error = $2
+            SET embedding_status = CASE
+                    WHEN embedding_attempts + 1 >= $3 THEN 'dead_letter'
+                    ELSE 'pending'
+                END,
+                embedding_error = $2,
+                embedding_claimed_at = NULL,
+                embedding_attempts = embedding_attempts + 1,
+                embedding_next_retry_at = CASE
+                    WHEN embedding_attempts + 1 >= $3 THEN NOW()
+                    ELSE NOW() + ($4 * INTERVAL '1 millisecond')
+                END,
+                embedding_dead_lettered_at = CASE
+                    WHEN embedding_attempts + 1 >= $3 THEN NOW()
+                    ELSE NULL
+                END
             WHERE id = $1
+            RETURNING embedding_status
             "#,
         )
         .bind(memory_id)
         .bind(error)
-        .execute(&self.pool)
+        .bind(EMBEDDING_MAX_ATTEMPTS)
+        .bind(EMBEDDING_RETRY_BACKOFF_MS)
+        .fetch_optional(&self.pool)
         .await
         .context("failed to mark memory embedding as failed")?;
-        Ok(())
+
+        let status = row
+            .as_ref()
+            .map(|value| value.get::<String, _>("embedding_status"))
+            .ok_or_else(|| anyhow!("memory entry `{memory_id}` was not found"))?;
+        if status == "dead_letter" {
+            Ok(EmbeddingFailureDisposition::DeadLettered)
+        } else {
+            Ok(EmbeddingFailureDisposition::RetryScheduled)
+        }
+    }
+
+    async fn list_dead_letter_embeddings(&self, limit: u32) -> Result<Vec<MemoryEntryRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, agent_id, content, summary, importance, is_summary, archived, embedding_status, created_at
+            FROM memory_entries
+            WHERE embedding_status = 'dead_letter'
+            ORDER BY created_at DESC
+            LIMIT $1
+            "#,
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list dead-letter memory embeddings")?;
+
+        Ok(rows.into_iter().map(map_memory_entry).collect())
+    }
+
+    async fn requeue_dead_letter_embedding(&self, memory_id: i64) -> Result<bool> {
+        let result = sqlx::query(
+            r#"
+            UPDATE memory_entries
+            SET embedding_status = 'pending',
+                embedding_error = NULL,
+                embedding_attempts = 0,
+                embedding_claimed_at = NULL,
+                embedding_next_retry_at = NOW(),
+                embedding_dead_lettered_at = NULL
+            WHERE id = $1
+              AND embedding_status = 'dead_letter'
+            "#,
+        )
+        .bind(memory_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to requeue dead-letter memory embedding")?;
+
+        Ok(result.rows_affected() == 1)
     }
 
     async fn list_memories_by_ids(&self, ids: &[i64]) -> Result<Vec<MemoryEntryRecord>> {

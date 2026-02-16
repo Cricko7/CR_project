@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -40,6 +42,12 @@ pub struct AgentEventRecord {
     pub occurred_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TickLeaseAcquireResult {
+    Acquired,
+    Busy,
+}
+
 #[async_trait]
 pub trait AgentCoreRepository: Send + Sync {
     async fn get_agent(&self, agent_id: Uuid) -> Result<Option<AgentRecord>>;
@@ -51,4 +59,13 @@ pub trait AgentCoreRepository: Send + Sync {
         agent_id: Option<Uuid>,
         limit: u32,
     ) -> Result<Vec<AgentEventRecord>>;
+    async fn has_completed_tick(&self, agent_id: Uuid, tick_id: &str) -> Result<bool>;
+    async fn try_acquire_tick_lease(
+        &self,
+        agent_id: Uuid,
+        tick_id: &str,
+        lease_ttl: Duration,
+    ) -> Result<TickLeaseAcquireResult>;
+    async fn release_tick_lease(&self, agent_id: Uuid, tick_id: &str) -> Result<()>;
+    async fn record_completed_tick(&self, agent_id: Uuid, tick_id: &str) -> Result<()>;
 }

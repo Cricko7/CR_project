@@ -22,8 +22,7 @@ impl QdrantVectorStore {
         if let Some(api_key) = &config.api_key {
             headers.insert(
                 "api-key",
-                HeaderValue::from_str(api_key)
-                    .context("invalid Qdrant API key header value")?,
+                HeaderValue::from_str(api_key).context("invalid Qdrant API key header value")?,
             );
         }
 
@@ -64,7 +63,10 @@ impl MemoryVectorStore for QdrantVectorStore {
             return Ok(());
         }
 
-        let error = response.text().await.unwrap_or_else(|_| "<no body>".to_owned());
+        let error = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<no body>".to_owned());
         bail!("qdrant ensure_collection failed: {error}");
     }
 
@@ -107,7 +109,10 @@ impl MemoryVectorStore for QdrantVectorStore {
         if response.status().is_success() {
             Ok(())
         } else {
-            let error = response.text().await.unwrap_or_else(|_| "<no body>".to_owned());
+            let error = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<no body>".to_owned());
             bail!("qdrant upsert failed: {error}")
         }
     }
@@ -144,7 +149,10 @@ impl MemoryVectorStore for QdrantVectorStore {
             .context("failed to call Qdrant search")?;
 
         if !response.status().is_success() {
-            let error = response.text().await.unwrap_or_else(|_| "<no body>".to_owned());
+            let error = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<no body>".to_owned());
             bail!("qdrant search failed: {error}");
         }
 

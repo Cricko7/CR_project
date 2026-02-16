@@ -12,6 +12,7 @@ const DEFAULT_HOST: &str = "0.0.0.0";
 const DEFAULT_API_PORT: u16 = 8080;
 const DEFAULT_SHUTDOWN_TIMEOUT_MS: u64 = 15_000;
 const DEFAULT_WORKER_TICK_INTERVAL_MS: u64 = 1_000;
+const DEFAULT_WORKER_TICK_CONCURRENCY: u32 = 8;
 const DEFAULT_MOOD_DECAY_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_DATABASE_MAX_CONNECTIONS: u32 = 10;
 const DEFAULT_DATABASE_CONNECT_TIMEOUT_MS: u64 = 5_000;
@@ -134,6 +135,7 @@ pub struct WorkerConfig {
     pub gemini: Option<GeminiConfig>,
     pub agent_ids: Vec<Uuid>,
     pub tick_interval: Duration,
+    pub tick_concurrency: u32,
     pub mood_decay_interval: Duration,
 }
 
@@ -147,8 +149,12 @@ impl WorkerConfig {
         let agent_ids = parse_uuid_list_env("WORKER_AGENT_IDS")?;
         let tick_interval_ms: u64 =
             parse_env("WORKER_TICK_INTERVAL_MS", DEFAULT_WORKER_TICK_INTERVAL_MS)?;
-        let mood_decay_interval_ms: u64 =
-            parse_env("WORKER_MOOD_DECAY_INTERVAL_MS", DEFAULT_MOOD_DECAY_INTERVAL_MS)?;
+        let tick_concurrency: u32 =
+            parse_env("WORKER_TICK_CONCURRENCY", DEFAULT_WORKER_TICK_CONCURRENCY)?;
+        let mood_decay_interval_ms: u64 = parse_env(
+            "WORKER_MOOD_DECAY_INTERVAL_MS",
+            DEFAULT_MOOD_DECAY_INTERVAL_MS,
+        )?;
 
         if tick_interval_ms == 0 {
             return Err(ConfigError::invalid(
@@ -162,6 +168,12 @@ impl WorkerConfig {
                 "must be greater than 0",
             ));
         }
+        if tick_concurrency == 0 {
+            return Err(ConfigError::invalid(
+                "WORKER_TICK_CONCURRENCY",
+                "must be greater than 0",
+            ));
+        }
 
         Ok(Self {
             common,
@@ -171,6 +183,7 @@ impl WorkerConfig {
             gemini,
             agent_ids,
             tick_interval: Duration::from_millis(tick_interval_ms),
+            tick_concurrency,
             mood_decay_interval: Duration::from_millis(mood_decay_interval_ms),
         })
     }
@@ -188,8 +201,7 @@ fn load_common_config(default_service_name: &str) -> Result<CommonConfig, Config
         .to_lowercase();
     validate_log_level(&log_level)?;
 
-    let shutdown_timeout_ms: u64 =
-        parse_env("SHUTDOWN_TIMEOUT_MS", DEFAULT_SHUTDOWN_TIMEOUT_MS)?;
+    let shutdown_timeout_ms: u64 = parse_env("SHUTDOWN_TIMEOUT_MS", DEFAULT_SHUTDOWN_TIMEOUT_MS)?;
     if shutdown_timeout_ms == 0 {
         return Err(ConfigError::invalid(
             "SHUTDOWN_TIMEOUT_MS",
@@ -212,7 +224,8 @@ fn load_database_config() -> Result<DatabaseConfig, ConfigError> {
         return Err(ConfigError::invalid("DATABASE_URL", "must not be empty"));
     }
 
-    let max_connections: u32 = parse_env("DATABASE_MAX_CONNECTIONS", DEFAULT_DATABASE_MAX_CONNECTIONS)?;
+    let max_connections: u32 =
+        parse_env("DATABASE_MAX_CONNECTIONS", DEFAULT_DATABASE_MAX_CONNECTIONS)?;
     if max_connections == 0 {
         return Err(ConfigError::invalid(
             "DATABASE_MAX_CONNECTIONS",
@@ -232,10 +245,8 @@ fn load_database_config() -> Result<DatabaseConfig, ConfigError> {
         parse_env("DATABASE_IDLE_TIMEOUT_MS", DEFAULT_DATABASE_IDLE_TIMEOUT_MS)?;
     let max_lifetime_ms: u64 =
         parse_env("DATABASE_MAX_LIFETIME_MS", DEFAULT_DATABASE_MAX_LIFETIME_MS)?;
-    let run_migrations: bool = parse_env(
-        "DATABASE_RUN_MIGRATIONS",
-        DEFAULT_DATABASE_RUN_MIGRATIONS,
-    )?;
+    let run_migrations: bool =
+        parse_env("DATABASE_RUN_MIGRATIONS", DEFAULT_DATABASE_RUN_MIGRATIONS)?;
 
     if connect_timeout_ms == 0 {
         return Err(ConfigError::invalid(
@@ -315,7 +326,10 @@ fn load_gemini_config() -> Result<Option<GeminiConfig>, ConfigError> {
         return Err(ConfigError::invalid("GEMINI_BASE_URL", "must not be empty"));
     }
     if timeout_ms == 0 {
-        return Err(ConfigError::invalid("GEMINI_TIMEOUT_MS", "must be greater than 0"));
+        return Err(ConfigError::invalid(
+            "GEMINI_TIMEOUT_MS",
+            "must be greater than 0",
+        ));
     }
     if retry_backoff_ms == 0 {
         return Err(ConfigError::invalid(
@@ -351,10 +365,16 @@ fn load_qdrant_config() -> Result<QdrantConfig, ConfigError> {
         return Err(ConfigError::invalid("QDRANT_URL", "must not be empty"));
     }
     if collection.trim().is_empty() {
-        return Err(ConfigError::invalid("QDRANT_COLLECTION", "must not be empty"));
+        return Err(ConfigError::invalid(
+            "QDRANT_COLLECTION",
+            "must not be empty",
+        ));
     }
     if timeout_ms == 0 {
-        return Err(ConfigError::invalid("QDRANT_TIMEOUT_MS", "must be greater than 0"));
+        return Err(ConfigError::invalid(
+            "QDRANT_TIMEOUT_MS",
+            "must be greater than 0",
+        ));
     }
     if vector_size == 0 {
         return Err(ConfigError::invalid(
@@ -373,13 +393,16 @@ fn load_qdrant_config() -> Result<QdrantConfig, ConfigError> {
 }
 
 fn load_memory_config() -> Result<MemoryConfig, ConfigError> {
-    let embed_batch_size: u32 = parse_env("MEMORY_EMBED_BATCH_SIZE", DEFAULT_MEMORY_EMBED_BATCH_SIZE)?;
+    let embed_batch_size: u32 =
+        parse_env("MEMORY_EMBED_BATCH_SIZE", DEFAULT_MEMORY_EMBED_BATCH_SIZE)?;
     let max_active_per_agent: u32 = parse_env(
         "MEMORY_MAX_ACTIVE_PER_AGENT",
         DEFAULT_MEMORY_MAX_ACTIVE_PER_AGENT,
     )?;
-    let summary_batch_size: u32 =
-        parse_env("MEMORY_SUMMARY_BATCH_SIZE", DEFAULT_MEMORY_SUMMARY_BATCH_SIZE)?;
+    let summary_batch_size: u32 = parse_env(
+        "MEMORY_SUMMARY_BATCH_SIZE",
+        DEFAULT_MEMORY_SUMMARY_BATCH_SIZE,
+    )?;
     let embed_interval_ms: u64 =
         parse_env("MEMORY_EMBED_INTERVAL_MS", DEFAULT_MEMORY_EMBED_INTERVAL_MS)?;
     let summary_interval_ms: u64 = parse_env(
@@ -436,7 +459,9 @@ fn parse_uuid_list_env(key: &'static str) -> Result<Vec<Uuid>, ConfigError> {
     raw.split(',')
         .map(str::trim)
         .filter(|token| !token.is_empty())
-        .map(|token| Uuid::parse_str(token).map_err(|error| ConfigError::parse(key, error.to_string())))
+        .map(|token| {
+            Uuid::parse_str(token).map_err(|error| ConfigError::parse(key, error.to_string()))
+        })
         .collect()
 }
 

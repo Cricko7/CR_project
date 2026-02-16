@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use anyhow::Context;
 use axum::extract::{
-    ws::{Message, WebSocket, WebSocketUpgrade},
     Path, Query, State,
+    ws::{Message, WebSocket, WebSocketUpgrade},
 };
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -26,8 +26,8 @@ use sim_backend::infrastructure::postgres::{
 use sim_backend::infrastructure::qdrant::QdrantVectorStore;
 use sim_backend::llm::LlmPort;
 use sim_backend::memory::{
-    MemoryRecallItem, MemoryRepository, MemoryService, MemoryVectorStore, SimpleHashEmbedder,
-    TextEmbedder,
+    MemoryEntryRecord, MemoryRecallItem, MemoryRepository, MemoryService, MemoryVectorStore,
+    SimpleHashEmbedder, TextEmbedder,
 };
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -166,6 +166,35 @@ struct ProcessEmbeddingsResponse {
     processed: u32,
     succeeded: u32,
     failed: u32,
+    retried: u32,
+    dead_lettered: u32,
+}
+
+#[derive(Deserialize)]
+struct DeadLetterQuery {
+    limit: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct DeadLetterEmbeddingsResponse {
+    items: Vec<DeadLetterEmbeddingItemResponse>,
+}
+
+#[derive(Serialize)]
+struct DeadLetterEmbeddingItemResponse {
+    memory_id: i64,
+    agent_id: Uuid,
+    content: String,
+    summary: Option<String>,
+    importance: f32,
+    created_at: String,
+    embedding_status: String,
+}
+
+#[derive(Serialize)]
+struct RequeueDeadLetterResponse {
+    memory_id: i64,
+    requeued: bool,
 }
 
 #[derive(Deserialize)]
@@ -284,8 +313,19 @@ async fn main() -> anyhow::Result<()> {
         .route("/events", get(list_events))
         .route("/agents/{id}/memories", post(append_agent_memory))
         .route("/agents/{id}/memories/recall", get(recall_agent_memory))
-        .route("/agents/{id}/memories/summarize", post(summarize_agent_memory))
-        .route("/memory/process-embeddings", post(process_memory_embeddings))
+        .route(
+            "/agents/{id}/memories/summarize",
+            post(summarize_agent_memory),
+        )
+        .route(
+            "/memory/process-embeddings",
+            post(process_memory_embeddings),
+        )
+        .route("/memory/dead-letter", get(list_dead_letter_embeddings))
+        .route(
+            "/memory/dead-letter/{memory_id}/requeue",
+            post(requeue_dead_letter_embedding),
+        )
         .route("/ws/events", get(ws_events))
         .with_state(state);
 
@@ -343,7 +383,9 @@ async fn trigger_agent_tick(
         .orchestrator
         .run_agent_tick(agent_id, tick_id.clone())
         .await
-        .map_err(|error| internal_error("tick_failed", format!("failed to run agent tick: {error}")))?;
+        .map_err(|error| {
+            internal_error("tick_failed", format!("failed to run agent tick: {error}"))
+        })?;
 
     match outcome {
         AgentTickOrchestratorOutcome::Executed(result) => match result.status {
@@ -354,7 +396,10 @@ async fn trigger_agent_tick(
                         result.agent_id,
                         format!(
                             "{} (mood={}, valence={:.2}, arousal={:.2})",
-                            result.action_summary, result.mood_label, result.valence, result.arousal
+                            result.action_summary,
+                            result.mood_label,
+                            result.valence,
+                            result.arousal
                         ),
                         0.7,
                     )
@@ -442,7 +487,12 @@ async fn get_agent_state(
         .repository
         .get_agent_state(agent_id)
         .await
-        .map_err(|error| internal_error("state_read_failed", format!("failed to read agent state: {error}")))?
+        .map_err(|error| {
+            internal_error(
+                "state_read_failed",
+                format!("failed to read agent state: {error}"),
+            )
+        })?
     else {
         return Err((
             StatusCode::NOT_FOUND,
@@ -471,7 +521,12 @@ async fn list_events(
         .repository
         .list_agent_events(query.agent_id, limit)
         .await
-        .map_err(|error| internal_error("events_read_failed", format!("failed to read events: {error}")))?;
+        .map_err(|error| {
+            internal_error(
+                "events_read_failed",
+                format!("failed to read events: {error}"),
+            )
+        })?;
 
     let items = records.into_iter().map(map_event_record).collect();
 
@@ -600,6 +655,50 @@ async fn process_memory_embeddings(
         processed: summary.processed,
         succeeded: summary.succeeded,
         failed: summary.failed,
+        retried: summary.retried,
+        dead_lettered: summary.dead_lettered,
+    }))
+}
+
+async fn list_dead_letter_embeddings(
+    State(state): State<ApiState>,
+    Query(query): Query<DeadLetterQuery>,
+) -> Result<Json<DeadLetterEmbeddingsResponse>, (StatusCode, Json<ApiErrorResponse>)> {
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let entries = state
+        .memory_service
+        .list_dead_letter_embeddings(limit)
+        .await
+        .map_err(|error| {
+            internal_error(
+                "memory_dead_letter_read_failed",
+                format!("failed to list dead-letter memory embeddings: {error}"),
+            )
+        })?;
+
+    Ok(Json(DeadLetterEmbeddingsResponse {
+        items: entries.into_iter().map(map_dead_letter_memory).collect(),
+    }))
+}
+
+async fn requeue_dead_letter_embedding(
+    State(state): State<ApiState>,
+    Path(memory_id): Path<i64>,
+) -> Result<Json<RequeueDeadLetterResponse>, (StatusCode, Json<ApiErrorResponse>)> {
+    let requeued = state
+        .memory_service
+        .requeue_dead_letter_embedding(memory_id)
+        .await
+        .map_err(|error| {
+            internal_error(
+                "memory_dead_letter_requeue_failed",
+                format!("failed to requeue dead-letter memory embedding: {error}"),
+            )
+        })?;
+
+    Ok(Json(RequeueDeadLetterResponse {
+        memory_id,
+        requeued,
     }))
 }
 
@@ -707,10 +806,19 @@ fn map_recall_item(item: MemoryRecallItem) -> RecallItemResponse {
     }
 }
 
-fn internal_error(
-    error: &'static str,
-    message: String,
-) -> (StatusCode, Json<ApiErrorResponse>) {
+fn map_dead_letter_memory(memory: MemoryEntryRecord) -> DeadLetterEmbeddingItemResponse {
+    DeadLetterEmbeddingItemResponse {
+        memory_id: memory.id,
+        agent_id: memory.agent_id,
+        content: memory.content,
+        summary: memory.summary,
+        importance: memory.importance,
+        created_at: memory.created_at.to_rfc3339(),
+        embedding_status: memory.embedding_status,
+    }
+}
+
+fn internal_error(error: &'static str, message: String) -> (StatusCode, Json<ApiErrorResponse>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(ApiErrorResponse { error, message }),

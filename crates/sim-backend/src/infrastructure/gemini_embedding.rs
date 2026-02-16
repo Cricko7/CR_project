@@ -61,7 +61,10 @@ impl GeminiEmbeddingClient {
             .context("failed to call Gemini embedding API")?;
 
         if !response.status().is_success() {
-            let body = response.text().await.unwrap_or_else(|_| "<no body>".to_owned());
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<no body>".to_owned());
             bail!("Gemini embedding request failed: {body}");
         }
 

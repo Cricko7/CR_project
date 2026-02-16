@@ -1,17 +1,19 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use uuid::Uuid;
 
 use crate::llm::{LlmGenerateRequest, LlmPort};
 use crate::memory::{
-    MemoryEntryRecord, MemoryRepository, MemoryVectorStore, NewMemoryEntry, TextEmbedder,
-    VectorSearchHit,
+    EmbeddingFailureDisposition, MemoryEntryRecord, MemoryRepository, MemoryVectorStore,
+    NewMemoryEntry, TextEmbedder, VectorSearchHit,
 };
 
 const DEFAULT_SUMMARY_CHARS: usize = 1200;
 const DEFAULT_EVENT_CHARS: usize = 240;
+const EMBEDDING_CLAIM_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone)]
 pub struct MemoryRecallItem {
@@ -24,6 +26,8 @@ pub struct MemoryProcessSummary {
     pub processed: u32,
     pub succeeded: u32,
     pub failed: u32,
+    pub retried: u32,
+    pub dead_lettered: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -78,15 +82,23 @@ impl MemoryService {
     }
 
     pub async fn process_pending_embeddings(&self, limit: u32) -> Result<MemoryProcessSummary> {
-        let pending = self.repository.list_pending_embeddings(limit).await?;
+        let pending = self
+            .repository
+            .claim_pending_embeddings(limit, EMBEDDING_CLAIM_TIMEOUT)
+            .await?;
         let mut summary = MemoryProcessSummary {
             processed: pending.len() as u32,
             succeeded: 0,
             failed: 0,
+            retried: 0,
+            dead_lettered: 0,
         };
 
         for memory in pending {
-            let text = memory.summary.clone().unwrap_or_else(|| memory.content.clone());
+            let text = memory
+                .summary
+                .clone()
+                .unwrap_or_else(|| memory.content.clone());
             let embedding_result = self.embedder.embed_document(&text).await;
             match embedding_result {
                 Ok(vector) => {
@@ -110,18 +122,30 @@ impl MemoryService {
                             summary.succeeded += 1;
                         }
                         Err(error) => {
-                            self.repository
+                            let disposition = self
+                                .repository
                                 .mark_embedding_failed(memory.id, &error.to_string())
                                 .await?;
                             summary.failed += 1;
+                            match disposition {
+                                EmbeddingFailureDisposition::RetryScheduled => summary.retried += 1,
+                                EmbeddingFailureDisposition::DeadLettered => {
+                                    summary.dead_lettered += 1
+                                }
+                            }
                         }
                     }
                 }
                 Err(error) => {
-                    self.repository
+                    let disposition = self
+                        .repository
                         .mark_embedding_failed(memory.id, &error.to_string())
                         .await?;
                     summary.failed += 1;
+                    match disposition {
+                        EmbeddingFailureDisposition::RetryScheduled => summary.retried += 1,
+                        EmbeddingFailureDisposition::DeadLettered => summary.dead_lettered += 1,
+                    }
                 }
             }
         }
@@ -198,6 +222,16 @@ impl MemoryService {
         })
     }
 
+    pub async fn list_dead_letter_embeddings(&self, limit: u32) -> Result<Vec<MemoryEntryRecord>> {
+        self.repository.list_dead_letter_embeddings(limit).await
+    }
+
+    pub async fn requeue_dead_letter_embedding(&self, memory_id: i64) -> Result<bool> {
+        self.repository
+            .requeue_dead_letter_embedding(memory_id)
+            .await
+    }
+
     async fn build_summary_text(&self, agent_id: Uuid, source: &[MemoryEntryRecord]) -> String {
         let deterministic = deterministic_summary(source);
         let Some(llm) = &self.summarizer_llm else {
@@ -211,7 +245,9 @@ impl MemoryService {
                 let short = trim_text(&entry.content, DEFAULT_EVENT_CHARS);
                 format!(
                     "[{}] {}",
-                    entry.created_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    entry
+                        .created_at
+                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
                     short
                 )
             })
@@ -250,8 +286,10 @@ async fn hydrate_recall_items(
 
     let ids: Vec<i64> = hits.iter().map(|hit| hit.memory_id).collect();
     let records = repository.list_memories_by_ids(&ids).await?;
-    let lookup: HashMap<i64, MemoryEntryRecord> =
-        records.into_iter().map(|record| (record.id, record)).collect();
+    let lookup: HashMap<i64, MemoryEntryRecord> = records
+        .into_iter()
+        .map(|record| (record.id, record))
+        .collect();
 
     let mut items = Vec::with_capacity(hits.len());
     for hit in hits {
@@ -307,12 +345,18 @@ fn trim_text(input: &str, max_chars: usize) -> String {
     if input.chars().count() <= max_chars {
         return input.trim().to_owned();
     }
-    input.chars().take(max_chars).collect::<String>().trim().to_owned()
+    input
+        .chars()
+        .take(max_chars)
+        .collect::<String>()
+        .trim()
+        .to_owned()
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use anyhow::Result;
     use async_trait::async_trait;
@@ -321,8 +365,8 @@ mod tests {
     use uuid::Uuid;
 
     use crate::memory::{
-        MemoryEntryRecord, MemoryRepository, MemoryVectorStore, NewMemoryEntry, SimpleHashEmbedder,
-        TextEmbedder, VectorSearchHit,
+        EmbeddingFailureDisposition, MemoryEntryRecord, MemoryRepository, MemoryVectorStore,
+        NewMemoryEntry, SimpleHashEmbedder, TextEmbedder, VectorSearchHit,
     };
 
     use super::MemoryService;
@@ -330,11 +374,24 @@ mod tests {
     #[derive(Default)]
     struct InMemoryRepo {
         rows: Mutex<Vec<MemoryEntryRecord>>,
+        dead_letter_on_fail: bool,
+    }
+
+    impl InMemoryRepo {
+        fn dead_letter_mode() -> Self {
+            Self {
+                rows: Mutex::new(Vec::new()),
+                dead_letter_on_fail: true,
+            }
+        }
     }
 
     #[async_trait]
     impl MemoryRepository for InMemoryRepo {
-        async fn insert_memory_entry(&self, new_entry: &NewMemoryEntry) -> Result<MemoryEntryRecord> {
+        async fn insert_memory_entry(
+            &self,
+            new_entry: &NewMemoryEntry,
+        ) -> Result<MemoryEntryRecord> {
             let mut rows = self.rows.lock().await;
             let record = MemoryEntryRecord {
                 id: rows.len() as i64 + 1,
@@ -351,13 +408,24 @@ mod tests {
             Ok(record)
         }
 
-        async fn list_pending_embeddings(&self, _limit: u32) -> Result<Vec<MemoryEntryRecord>> {
-            let rows = self.rows.lock().await;
-            Ok(rows
-                .iter()
-                .filter(|row| row.embedding_status == "pending")
-                .cloned()
-                .collect())
+        async fn claim_pending_embeddings(
+            &self,
+            limit: u32,
+            _claim_timeout: Duration,
+        ) -> Result<Vec<MemoryEntryRecord>> {
+            let mut rows = self.rows.lock().await;
+            let mut claimed = Vec::new();
+            for row in &mut *rows {
+                if row.embedding_status != "pending" {
+                    continue;
+                }
+                row.embedding_status = "processing".to_owned();
+                claimed.push(row.clone());
+                if claimed.len() >= limit as usize {
+                    break;
+                }
+            }
+            Ok(claimed)
         }
 
         async fn mark_embedding_done(&self, memory_id: i64, _embedding_model: &str) -> Result<()> {
@@ -368,12 +436,43 @@ mod tests {
             Ok(())
         }
 
-        async fn mark_embedding_failed(&self, memory_id: i64, _error: &str) -> Result<()> {
+        async fn mark_embedding_failed(
+            &self,
+            memory_id: i64,
+            _error: &str,
+        ) -> Result<EmbeddingFailureDisposition> {
             let mut rows = self.rows.lock().await;
             if let Some(row) = rows.iter_mut().find(|row| row.id == memory_id) {
-                row.embedding_status = "failed".to_owned();
+                if self.dead_letter_on_fail {
+                    row.embedding_status = "dead_letter".to_owned();
+                    return Ok(EmbeddingFailureDisposition::DeadLettered);
+                }
+                row.embedding_status = "pending".to_owned();
             }
-            Ok(())
+            Ok(EmbeddingFailureDisposition::RetryScheduled)
+        }
+
+        async fn list_dead_letter_embeddings(&self, limit: u32) -> Result<Vec<MemoryEntryRecord>> {
+            let rows = self.rows.lock().await;
+            let mut dead: Vec<MemoryEntryRecord> = rows
+                .iter()
+                .filter(|row| row.embedding_status == "dead_letter")
+                .cloned()
+                .collect();
+            dead.truncate(limit as usize);
+            Ok(dead)
+        }
+
+        async fn requeue_dead_letter_embedding(&self, memory_id: i64) -> Result<bool> {
+            let mut rows = self.rows.lock().await;
+            if let Some(row) = rows
+                .iter_mut()
+                .find(|row| row.id == memory_id && row.embedding_status == "dead_letter")
+            {
+                row.embedding_status = "pending".to_owned();
+                return Ok(true);
+            }
+            Ok(false)
         }
 
         async fn list_memories_by_ids(&self, ids: &[i64]) -> Result<Vec<MemoryEntryRecord>> {
@@ -421,6 +520,23 @@ mod tests {
     #[derive(Default)]
     struct InMemoryVectorStore {
         hits: Mutex<Vec<VectorSearchHit>>,
+    }
+
+    struct AlwaysFailEmbedder;
+
+    #[async_trait]
+    impl TextEmbedder for AlwaysFailEmbedder {
+        fn model_name(&self) -> &str {
+            "always-fail"
+        }
+
+        async fn embed_document(&self, _text: &str) -> Result<Vec<f32>> {
+            Err(anyhow::anyhow!("simulated embedding outage"))
+        }
+
+        async fn embed_query(&self, _text: &str) -> Result<Vec<f32>> {
+            Err(anyhow::anyhow!("simulated embedding outage"))
+        }
     }
 
     #[async_trait]
@@ -494,5 +610,41 @@ mod tests {
         assert_eq!(recalled.len(), 2);
         assert_eq!(recalled[0].memory.id, second.id);
         assert_eq!(recalled[1].memory.id, first.id);
+    }
+
+    #[tokio::test]
+    async fn moves_failed_embeddings_to_dead_letter_and_supports_requeue() {
+        let repo = Arc::new(InMemoryRepo::dead_letter_mode());
+        let store = Arc::new(InMemoryVectorStore::default());
+        let embedder: Arc<dyn TextEmbedder> = Arc::new(AlwaysFailEmbedder);
+        let service = MemoryService::new(repo.clone(), store, embedder, None, 8);
+        let agent_id = Uuid::new_v4();
+
+        let inserted = service
+            .append_memory(agent_id, "This embedding will fail", 0.5)
+            .await
+            .expect("memory should be stored");
+
+        let process = service
+            .process_pending_embeddings(10)
+            .await
+            .expect("processing should finish");
+        assert_eq!(process.processed, 1);
+        assert_eq!(process.failed, 1);
+        assert_eq!(process.retried, 0);
+        assert_eq!(process.dead_lettered, 1);
+
+        let dead_letter = service
+            .list_dead_letter_embeddings(10)
+            .await
+            .expect("dead-letter list should be readable");
+        assert_eq!(dead_letter.len(), 1);
+        assert_eq!(dead_letter[0].id, inserted.id);
+
+        let requeued = service
+            .requeue_dead_letter_embedding(inserted.id)
+            .await
+            .expect("requeue should work");
+        assert!(requeued);
     }
 }

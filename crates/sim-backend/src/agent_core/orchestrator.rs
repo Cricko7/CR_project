@@ -1,17 +1,20 @@
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::agent_core::{
-    AgentCoreRepository, AgentStateRecord, AgentTickRunner, NewAgentEvent, TickRunOutcome,
+    AgentCoreRepository, AgentStateRecord, AgentTickRunner, NewAgentEvent, TickLeaseAcquireResult,
+    TickRunOutcome,
 };
 use crate::llm::{LlmGenerateRequest, LlmPort};
 
 const DEFAULT_TICK_HISTORY_PER_AGENT: usize = 256;
+const DEFAULT_TICK_LEASE_TTL: Duration = Duration::from_secs(90);
 const LLM_SUMMARY_MAX_CHARS: usize = 512;
 const EVENT_DESCRIPTION_MAX_CHARS: usize = 180;
 
@@ -86,6 +89,25 @@ impl AgentTickOrchestrator {
         tick_id: Option<String>,
     ) -> Result<AgentTickOrchestratorOutcome> {
         let tick_id = tick_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+        if self
+            .repository
+            .has_completed_tick(agent_id, &tick_id)
+            .await?
+        {
+            return Ok(AgentTickOrchestratorOutcome::SkippedDuplicate);
+        }
+
+        match self
+            .repository
+            .try_acquire_tick_lease(agent_id, &tick_id, DEFAULT_TICK_LEASE_TTL)
+            .await?
+        {
+            TickLeaseAcquireResult::Acquired => {}
+            TickLeaseAcquireResult::Busy => {
+                return Ok(AgentTickOrchestratorOutcome::SkippedBusy);
+            }
+        }
+
         let repository = Arc::clone(&self.repository);
         let llm = self.llm.clone();
         let tick_id_for_closure = tick_id.clone();
@@ -97,10 +119,29 @@ impl AgentTickOrchestrator {
             })
             .await;
 
+        let release_result = self.repository.release_tick_lease(agent_id, &tick_id).await;
+        if let Err(error) = release_result {
+            tracing::error!(
+                agent_id = %agent_id,
+                tick_id,
+                error = %error,
+                "failed to release global tick lease"
+            );
+            return Err(error.context("failed to release global tick lease"));
+        }
+
+        if matches!(
+            tick_outcome,
+            TickRunOutcome::Executed(_) | TickRunOutcome::SkippedDuplicate
+        ) {
+            self.repository
+                .record_completed_tick(agent_id, &tick_id)
+                .await
+                .context("failed to persist completed tick idempotency")?;
+        }
+
         match tick_outcome {
-            TickRunOutcome::Executed(result) => {
-                Ok(AgentTickOrchestratorOutcome::Executed(result?))
-            }
+            TickRunOutcome::Executed(result) => Ok(AgentTickOrchestratorOutcome::Executed(result?)),
             TickRunOutcome::SkippedBusy => Ok(AgentTickOrchestratorOutcome::SkippedBusy),
             TickRunOutcome::SkippedDuplicate => Ok(AgentTickOrchestratorOutcome::SkippedDuplicate),
         }
@@ -148,13 +189,7 @@ async fn execute_tick(
         })
         .await?;
 
-    let (
-        action_summary,
-        llm_used,
-        llm_model,
-        llm_error,
-        llm_latency_ms,
-    ) = generate_action_summary(
+    let (action_summary, llm_used, llm_model, llm_error, llm_latency_ms) = generate_action_summary(
         llm.as_deref(),
         &agent.name,
         &agent.personality_json,
@@ -219,7 +254,13 @@ async fn generate_action_summary(
     let fallback = fallback_summary(agent_name, mood_label);
 
     let Some(llm) = llm else {
-        return (fallback, false, None, Some("llm_not_configured".to_owned()), None);
+        return (
+            fallback,
+            false,
+            None,
+            Some("llm_not_configured".to_owned()),
+            None,
+        );
     };
 
     let request = LlmGenerateRequest {
@@ -282,14 +323,20 @@ fn trim_text(input: &str, max_chars: usize) -> String {
     if input.chars().count() <= max_chars {
         return input.trim().to_owned();
     }
-    input.chars().take(max_chars).collect::<String>().trim().to_owned()
+    input
+        .chars()
+        .take(max_chars)
+        .collect::<String>()
+        .trim()
+        .to_owned()
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use anyhow::Result;
     use async_trait::async_trait;
@@ -300,18 +347,19 @@ mod tests {
 
     use crate::agent_core::{
         AgentCoreRepository, AgentEventRecord, AgentRecord, AgentStateRecord, NewAgentEvent,
+        TickLeaseAcquireResult,
     };
     use crate::llm::{LlmGenerateRequest, LlmGenerateResponse, LlmPort};
 
-    use super::{
-        AgentTickExecutionStatus, AgentTickOrchestrator, AgentTickOrchestratorOutcome,
-    };
+    use super::{AgentTickExecutionStatus, AgentTickOrchestrator, AgentTickOrchestratorOutcome};
 
     #[derive(Default)]
     struct InMemoryAgentCoreRepository {
         agents: Mutex<HashMap<Uuid, AgentRecord>>,
         states: Mutex<HashMap<Uuid, AgentStateRecord>>,
         events: Mutex<Vec<AgentEventRecord>>,
+        completed_ticks: Mutex<HashMap<Uuid, std::collections::HashSet<String>>>,
+        active_leases: Mutex<HashMap<Uuid, String>>,
     }
 
     enum StubLlmMode {
@@ -405,6 +453,45 @@ mod tests {
             filtered.truncate(limit as usize);
             Ok(filtered)
         }
+
+        async fn has_completed_tick(&self, agent_id: Uuid, tick_id: &str) -> Result<bool> {
+            let completed = self.completed_ticks.lock().await;
+            Ok(completed
+                .get(&agent_id)
+                .map(|ticks| ticks.contains(tick_id))
+                .unwrap_or(false))
+        }
+
+        async fn try_acquire_tick_lease(
+            &self,
+            agent_id: Uuid,
+            tick_id: &str,
+            _lease_ttl: Duration,
+        ) -> Result<TickLeaseAcquireResult> {
+            let mut leases = self.active_leases.lock().await;
+            if leases.contains_key(&agent_id) {
+                return Ok(TickLeaseAcquireResult::Busy);
+            }
+            leases.insert(agent_id, tick_id.to_owned());
+            Ok(TickLeaseAcquireResult::Acquired)
+        }
+
+        async fn release_tick_lease(&self, agent_id: Uuid, tick_id: &str) -> Result<()> {
+            let mut leases = self.active_leases.lock().await;
+            if leases.get(&agent_id).map(|value| value.as_str()) == Some(tick_id) {
+                leases.remove(&agent_id);
+            }
+            Ok(())
+        }
+
+        async fn record_completed_tick(&self, agent_id: Uuid, tick_id: &str) -> Result<()> {
+            let mut completed = self.completed_ticks.lock().await;
+            completed
+                .entry(agent_id)
+                .or_insert_with(HashSet::new)
+                .insert(tick_id.to_owned());
+            Ok(())
+        }
     }
 
     #[tokio::test]
@@ -473,15 +560,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn skips_duplicate_from_repository_idempotency_history() {
+        let repository = Arc::new(InMemoryAgentCoreRepository::default());
+        let agent_id = Uuid::new_v4();
+        seed_agent(repository.as_ref(), agent_id, "Nora").await;
+        repository
+            .record_completed_tick(agent_id, "tick-db-dupe")
+            .await
+            .expect("should seed completed tick");
+
+        let orchestrator = AgentTickOrchestrator::new(repository);
+        let outcome = orchestrator
+            .run_agent_tick(agent_id, Some("tick-db-dupe".to_owned()))
+            .await
+            .expect("tick should complete");
+
+        assert!(matches!(
+            outcome,
+            AgentTickOrchestratorOutcome::SkippedDuplicate
+        ));
+    }
+
+    #[tokio::test]
+    async fn skips_busy_when_global_lease_is_owned_by_other_worker() {
+        let repository = Arc::new(InMemoryAgentCoreRepository::default());
+        let agent_id = Uuid::new_v4();
+        seed_agent(repository.as_ref(), agent_id, "Ivy").await;
+
+        {
+            let mut leases = repository.active_leases.lock().await;
+            leases.insert(agent_id, "someone-else".to_owned());
+        }
+
+        let orchestrator = AgentTickOrchestrator::new(repository);
+        let outcome = orchestrator
+            .run_agent_tick(agent_id, Some("tick-busy".to_owned()))
+            .await
+            .expect("tick should complete");
+
+        assert!(matches!(outcome, AgentTickOrchestratorOutcome::SkippedBusy));
+    }
+
+    #[tokio::test]
     async fn uses_llm_summary_when_available() {
         let repository = Arc::new(InMemoryAgentCoreRepository::default());
         let agent_id = Uuid::new_v4();
         seed_agent(repository.as_ref(), agent_id, "Lena").await;
         let calls = Arc::new(AtomicUsize::new(0));
-        let llm: Arc<dyn LlmPort> =
-            Arc::new(StubLlm::success("Plans a cooperative conversation.", Arc::clone(&calls)));
+        let llm: Arc<dyn LlmPort> = Arc::new(StubLlm::success(
+            "Plans a cooperative conversation.",
+            Arc::clone(&calls),
+        ));
 
-        let orchestrator = AgentTickOrchestrator::new(repository.clone()).with_optional_llm(Some(llm));
+        let orchestrator =
+            AgentTickOrchestrator::new(repository.clone()).with_optional_llm(Some(llm));
         let outcome = orchestrator
             .run_agent_tick(agent_id, Some("tick-llm-ok".to_owned()))
             .await
@@ -509,7 +641,8 @@ mod tests {
         let llm: Arc<dyn LlmPort> =
             Arc::new(StubLlm::fail("simulated llm outage", Arc::clone(&calls)));
 
-        let orchestrator = AgentTickOrchestrator::new(repository.clone()).with_optional_llm(Some(llm));
+        let orchestrator =
+            AgentTickOrchestrator::new(repository.clone()).with_optional_llm(Some(llm));
         let outcome = orchestrator
             .run_agent_tick(agent_id, Some("tick-llm-fail".to_owned()))
             .await
@@ -522,21 +655,21 @@ mod tests {
         let event = events.last().expect("event should exist");
         assert_eq!(event.payload_json["llm"]["used"], false);
         assert_eq!(event.payload_json["llm"]["configured"], true);
-        assert!(event.payload_json["llm"]["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("simulated llm outage"));
-        assert!(event.payload_json["action_summary"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("Mia"));
+        assert!(
+            event.payload_json["llm"]["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("simulated llm outage")
+        );
+        assert!(
+            event.payload_json["action_summary"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Mia")
+        );
     }
 
-    async fn seed_agent(
-        repository: &InMemoryAgentCoreRepository,
-        agent_id: Uuid,
-        name: &str,
-    ) {
+    async fn seed_agent(repository: &InMemoryAgentCoreRepository, agent_id: Uuid, name: &str) {
         let mut agents = repository.agents.lock().await;
         agents.insert(
             agent_id,

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -8,6 +10,7 @@ use uuid::Uuid;
 
 use crate::agent_core::{
     AgentCoreRepository, AgentEventRecord, AgentRecord, AgentStateRecord, NewAgentEvent,
+    TickLeaseAcquireResult,
 };
 
 #[derive(Clone)]
@@ -134,6 +137,107 @@ impl AgentCoreRepository for PostgresAgentCoreRepository {
         };
 
         Ok(rows.into_iter().map(map_agent_event_record).collect())
+    }
+
+    async fn has_completed_tick(&self, agent_id: Uuid, tick_id: &str) -> Result<bool> {
+        let row = sqlx::query(
+            r#"
+            SELECT 1
+            FROM agent_tick_dedup
+            WHERE agent_id = $1 AND tick_id = $2
+            "#,
+        )
+        .bind(agent_id)
+        .bind(tick_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to check completed tick idempotency")?;
+
+        Ok(row.is_some())
+    }
+
+    async fn try_acquire_tick_lease(
+        &self,
+        agent_id: Uuid,
+        tick_id: &str,
+        lease_ttl: Duration,
+    ) -> Result<TickLeaseAcquireResult> {
+        let ttl_ms = i64::try_from(lease_ttl.as_millis())
+            .unwrap_or(i64::MAX)
+            .max(1);
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to open transaction for tick lease acquisition")?;
+
+        sqlx::query(
+            r#"
+            DELETE FROM agent_tick_locks
+            WHERE agent_id = $1
+              AND expires_at <= NOW()
+            "#,
+        )
+        .bind(agent_id)
+        .execute(&mut *tx)
+        .await
+        .context("failed to clear expired tick lease")?;
+
+        let insert_result = sqlx::query(
+            r#"
+            INSERT INTO agent_tick_locks (agent_id, tick_id, expires_at)
+            VALUES ($1, $2, NOW() + ($3 * INTERVAL '1 millisecond'))
+            ON CONFLICT (agent_id) DO NOTHING
+            "#,
+        )
+        .bind(agent_id)
+        .bind(tick_id)
+        .bind(ttl_ms)
+        .execute(&mut *tx)
+        .await
+        .context("failed to acquire tick lease")?;
+
+        tx.commit()
+            .await
+            .context("failed to commit tick lease acquisition transaction")?;
+
+        if insert_result.rows_affected() == 1 {
+            Ok(TickLeaseAcquireResult::Acquired)
+        } else {
+            Ok(TickLeaseAcquireResult::Busy)
+        }
+    }
+
+    async fn release_tick_lease(&self, agent_id: Uuid, tick_id: &str) -> Result<()> {
+        sqlx::query(
+            r#"
+            DELETE FROM agent_tick_locks
+            WHERE agent_id = $1
+              AND tick_id = $2
+            "#,
+        )
+        .bind(agent_id)
+        .bind(tick_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to release tick lease")?;
+        Ok(())
+    }
+
+    async fn record_completed_tick(&self, agent_id: Uuid, tick_id: &str) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO agent_tick_dedup (agent_id, tick_id)
+            VALUES ($1, $2)
+            ON CONFLICT (agent_id, tick_id) DO NOTHING
+            "#,
+        )
+        .bind(agent_id)
+        .bind(tick_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to persist completed tick idempotency record")?;
+        Ok(())
     }
 }
 

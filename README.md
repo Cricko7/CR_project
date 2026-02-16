@@ -20,7 +20,7 @@ Backend для симуляции мира автономных AI-агенто�
 
 | Требование | Статус | Что есть сейчас |
 |---|---|---|
-| 1. Долговременная память (vector DB + summarization) | `PARTIAL+` | Реализованы `memory_entries`, векторизация, Qdrant recall, архивирование старых воспоминаний, авто-суммаризация overflow |
+| 1. Долговременная память (vector DB + summarization) | `FULLY IMPLEMENTED` | Реализованы `memory_entries`, embedding pipeline с retry+DLQ, Qdrant recall, архивирование старых воспоминаний, авто-суммаризация overflow, API для dead-letter requeue |
 | 2. Эмоциональный интеллект | `PARTIAL` | Поля valence/arousal/mood есть, но динамика эмоций и mood decay пока не реализованы (воркер-заглушка) |
 | 3. Архитектура агента (рефлексия→цель→действие) | `PARTIAL` | Есть tick orchestrator + LLM summary, но отдельные стадии планирования пока не декомпозированы |
 | 4. Мультиагентность (общение, отношения) | `PARTIAL` | Таблицы `messages`, `relationships` есть; процессинг межагентных сообщений/обновления отношений пока не поднят |
@@ -170,7 +170,9 @@ CR_project/
 │   └── sim-backend/
 │       ├── migrations/
 │       │   ├── 0001_initial_schema.sql
-│       │   └── 0002_memory_long_term.sql
+│       │   ├── 0002_memory_long_term.sql
+│       │   ├── 0003_concurrency_failure_modes.sql
+│       │   └── 0004_memory_embedding_retry_dlq.sql
 │       └── src/
 │           ├── app/                # config, runtime, observability
 │           ├── agent_core/         # orchestrator, persistence traits, tick runner
@@ -187,24 +189,31 @@ CR_project/
 
 ### 7.1 Tick flow
 1. API (`POST /agents/{id}/ticks`) или worker tick loop вызывает `AgentTickOrchestrator`.
-2. `AgentTickRunner` защищает от:
+2. Orchestrator сначала проверяет persisted idempotency и берет глобальный lease на агента в Postgres:
+   - completed tick id -> `SkippedDuplicate`;
+   - lease занят другим процессом -> `SkippedBusy`.
+3. `AgentTickRunner` защищает от:
    - duplicate tick id;
    - concurrent tick для одного агента в пределах одного процесса.
-3. Orchestrator:
+4. Orchestrator:
    - читает agent + state;
    - upsert state;
    - генерирует action summary (Gemini или fallback);
    - пишет event в `events`.
-4. После успешного тика сервис пытается append memory с текстом результата.
+5. После завершения (success/error) tick id фиксируется в persisted history, lease освобождается.
+6. После успешного тика сервис пытается append memory с текстом результата.
 
 ### 7.2 Memory embedding flow
 1. Новая память попадает в `memory_entries` со `embedding_status='pending'`.
-2. Worker job `memory_embedding_worker` (или API endpoint вручную) берет pending batch.
+2. Worker job `memory_embedding_worker` (или API endpoint вручную) атомарно claim'ит due batch через `FOR UPDATE SKIP LOCKED` и переводит записи в `embedding_status='processing'`.
 3. Embedding через GeminiEmbeddingClient или локальный hash embedder.
 4. Vector upsert в Qdrant.
 5. Статус в Postgres:
    - success -> `embedded` + `embedding_model`;
-   - failure -> `failed` + `embedding_error`.
+   - transient failure -> `pending` + `embedding_error` + retry backoff;
+   - max attempts exceeded -> `dead_letter` + `embedding_dead_lettered_at`.
+6. Если воркер упал на середине, `processing` записи можно reclaim'ить после claim-timeout.
+7. Dead-letter записи доступны через API и могут быть requeue вручную.
 
 ### 7.3 Memory overflow summarization flow
 1. Проверяется count активных memories агента.
@@ -398,12 +407,45 @@ Response:
 ```json
 {
   "processed": 10,
-  "succeeded": 10,
-  "failed": 0
+  "succeeded": 8,
+  "failed": 2,
+  "retried": 1,
+  "dead_lettered": 1
 }
 ```
 
-### 8.9 WebSocket events
+### 8.9 Dead-letter embeddings
+
+#### `GET /memory/dead-letter?limit=<1..200>`
+
+Response:
+```json
+{
+  "items": [
+    {
+      "memory_id": 42,
+      "agent_id": "uuid",
+      "content": "Agent found a treasure map",
+      "summary": null,
+      "importance": 0.8,
+      "created_at": "2026-02-16T12:00:00Z",
+      "embedding_status": "dead_letter"
+    }
+  ]
+}
+```
+
+#### `POST /memory/dead-letter/{memory_id}/requeue`
+
+Response:
+```json
+{
+  "memory_id": 42,
+  "requeued": true
+}
+```
+
+### 8.10 WebSocket events
 
 #### `GET /ws/events?agent_id=<uuid>&snapshot_limit=<1..200>`
 
@@ -439,6 +481,8 @@ Examples:
 Миграции:
 - `crates/sim-backend/migrations/0001_initial_schema.sql`
 - `crates/sim-backend/migrations/0002_memory_long_term.sql`
+- `crates/sim-backend/migrations/0003_concurrency_failure_modes.sql`
+- `crates/sim-backend/migrations/0004_memory_embedding_retry_dlq.sql`
 
 Основные таблицы:
 - `agents`: карточка агента, personality JSON.
@@ -456,6 +500,9 @@ Examples:
 - `summarized_by_id`
 - `embedding_model`
 - `embedding_error`
+- `embedding_attempts`
+- `embedding_next_retry_at`
+- `embedding_dead_lettered_at`
 - `last_accessed_at` (сейчас не обновляется)
 
 ### 9.2 Qdrant
@@ -538,6 +585,7 @@ Payload в point:
 |---|---|
 | `WORKER_AGENT_IDS` | empty |
 | `WORKER_TICK_INTERVAL_MS` | `1000` |
+| `WORKER_TICK_CONCURRENCY` | `8` |
 | `WORKER_MOOD_DECAY_INTERVAL_MS` | `5000` |
 
 ---
@@ -569,6 +617,7 @@ set DATABASE_RUN_MIGRATIONS=true
 set API_HOST=127.0.0.1
 set API_PORT=8080
 set WORKER_AGENT_IDS=<uuid1>,<uuid2>
+set WORKER_TICK_CONCURRENCY=8
 set GEMINI_API_KEY=<your_google_api_key>
 ```
 
@@ -615,8 +664,7 @@ VALUES
 Что отсутствует:
 - Prometheus metrics endpoint;
 - distributed tracing (trace-id across services);
-- SLO/error budget dashboards;
-- DLQ/retry queues для фейлов embedding/summarization.
+- SLO/error budget dashboards.
 
 ---
 
@@ -633,15 +681,13 @@ VALUES
 2. **Нет rate limiting** на дорогие endpoint'ы (`/ticks`, `/memories/*`, `/process-embeddings`).
 3. **Нет tenant isolation** (single-world assumptions).
 4. **In-memory WS hub** не защищен и не масштабируется межинстансно.
-5. **Cross-process idempotency gap**: dedup тиков только внутри процесса, API и worker могут продублировать операции.
-6. **Нет секрет-менеджмента** (Vault/KMS), только env vars.
-7. **Нет audit trail** действий админа на уровне API policy.
+5. **Нет секрет-менеджмента** (Vault/KMS), только env vars.
+6. **Нет audit trail** действий админа на уровне API policy.
 
 ### Минимум, который стоит сделать перед демо
 1. Добавить простой JWT/API key guard на admin endpoints.
 2. Добавить глобальный rate limit (IP + endpoint bucket).
-3. Ввести persisted idempotency key для tick'ов в Postgres.
-4. Ограничить CORS и WS origins.
+3. Ограничить CORS и WS origins.
 
 ---
 
@@ -650,15 +696,16 @@ VALUES
 ### Уже учтено
 - local single-flight для тиков одного агента (`Semaphore(1)` на agent id);
 - duplicate tick id history per agent;
+- persisted tick idempotency в Postgres (`agent_tick_dedup`);
+- cross-process lease на tick per agent (`agent_tick_locks` с TTL);
+- atomic claim для embedding jobs (`FOR UPDATE SKIP LOCKED`, `processing` + timeout reclaim);
+- parallel tick processing в worker с ограничением `WORKER_TICK_CONCURRENCY`;
 - graceful shutdown всех фоновых задач;
 - worker loop не падает процессом при одиночных ошибках.
 
 ### Пропущенные failure modes
-1. **API+Worker race на тики**: нет глобальной блокировки/идемпотентности.
-2. **Embedding double-processing**: ручной API процесс + worker могут взять одинаковые pending записи.
-3. **Qdrant/Gemini partial outage**: нет circuit breaker / backpressure policy.
-4. **WS live consistency**: worker-generated events не попадают в live hub API процесса.
-5. **Slow LLM call**: tick loop для всех агентов последовательный, один медленный агент тормозит остальных.
+1. **Qdrant/Gemini partial outage**: нет circuit breaker / backpressure policy.
+2. **WS live consistency**: worker-generated events не попадают в live hub API процесса.
 
 ---
 
@@ -686,14 +733,14 @@ VALUES
 5. Постгрес-репозиторий для agent core.
 6. Memory service:
    - append;
-   - embedding pipeline;
+   - embedding pipeline с retry/backoff + DLQ;
    - vector recall;
    - overflow summarization.
 7. Qdrant adapter и Gemini adapters.
 8. REST endpoints для state/events/memory/ticks.
 9. WebSocket endpoint с snapshot + live events.
 10. Worker циклы: ticks, mood-decay (stub), embedding, summarization.
-11. Миграции для базовой схемы и long-term memory.
+11. Миграции для базовой схемы, long-term memory и concurrency/failure hardening.
 12. Unit tests для `agent_core` и `memory`.
 
 ---
@@ -729,7 +776,7 @@ VALUES
 ### P2 (hardening)
 1. Prometheus metrics + `/metrics`.
 2. Idempotency keys на уровне БД.
-3. Retry policy + DLQ для memory/LLM jobs.
+3. Circuit breaker policy для LLM/Qdrant outage.
 4. Load testing и latency budgets.
 5. CI pipeline с lint + test + migration check.
 
@@ -755,6 +802,8 @@ VALUES
 4. Проверь миграции:
    - `migrations/0001_initial_schema.sql`
    - `migrations/0002_memory_long_term.sql`
+   - `migrations/0003_concurrency_failure_modes.sql`
+   - `migrations/0004_memory_embedding_retry_dlq.sql`
 5. Проверь текущий контракт API:
    - все endpoints в `crates/api/src/main.rs`.
 6. Проверь поведение конкуррентности:
@@ -764,7 +813,8 @@ VALUES
 - memory recall работает только для `embedded` записей;
 - summary-память создается как отдельная запись и архивирует source;
 - mood/state валидны в диапазоне `[-1.0, 1.0]` (clamp в orchestrator);
-- duplicate/busy tick защита только process-local.
+- duplicate/busy tick защита есть и process-local, и cross-process через Postgres lease/idempotency;
+- `embedding_status` цикл: `pending -> processing -> embedded | pending(retry) | dead_letter`.
 
 Что менять осторожно:
 - формат payload в `events` (его читает UI/аналитика);

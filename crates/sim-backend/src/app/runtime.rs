@@ -78,7 +78,9 @@ impl ServiceRuntime {
                     Ok((task, Err(error))) => {
                         tracing::error!(service = self.service_name, task, error = %error, "task stopped with error");
                         if primary_error.is_none() {
-                            primary_error = Some(error.context(format!("task `{task}` failed during shutdown")));
+                            primary_error = Some(
+                                error.context(format!("task `{task}` failed during shutdown")),
+                            );
                         }
                     }
                     Err(join_error) => {

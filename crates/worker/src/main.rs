@@ -10,13 +10,16 @@ use sim_backend::app::runtime::ServiceRuntime;
 use sim_backend::infrastructure::gemini::GeminiClient;
 use sim_backend::infrastructure::gemini_embedding::GeminiEmbeddingClient;
 use sim_backend::infrastructure::postgres::{
-    ensure_ready, PostgresAgentCoreRepository, PostgresMemoryRepository,
+    PostgresAgentCoreRepository, PostgresMemoryRepository, ensure_ready,
 };
 use sim_backend::infrastructure::qdrant::QdrantVectorStore;
 use sim_backend::llm::LlmPort;
 use sim_backend::memory::{
     MemoryRepository, MemoryService, MemoryVectorStore, SimpleHashEmbedder, TextEmbedder,
 };
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
+use uuid::Uuid;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -63,6 +66,7 @@ async fn main() -> anyhow::Result<()> {
 
     let tick_interval = config.tick_interval;
     let agent_ids = config.agent_ids.clone();
+    let tick_concurrency = config.tick_concurrency as usize;
     let tick_orchestrator = orchestrator.clone();
     let tick_memory_service = Arc::clone(&memory_service);
     let tick_token = cancellation.clone();
@@ -74,6 +78,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         let mut interval = tokio::time::interval(tick_interval);
+        let semaphore = Arc::new(Semaphore::new(tick_concurrency));
         loop {
             tokio::select! {
                 _ = tick_token.cancelled() => {
@@ -81,58 +86,23 @@ async fn main() -> anyhow::Result<()> {
                     break;
                 }
                 _ = interval.tick() => {
-                    for agent_id in &agent_ids {
-                        match tick_orchestrator.run_agent_tick(*agent_id, None).await {
-                            Ok(AgentTickOrchestratorOutcome::Executed(result)) => {
-                                match result.status {
-                                    AgentTickExecutionStatus::Applied => {
-                                        tracing::info!(
-                                            agent_id = %result.agent_id,
-                                            tick_id = %result.tick_id,
-                                            event_id = ?result.event_id,
-                                            mood = %result.mood_label,
-                                            "agent tick applied"
-                                        );
+                    let mut in_flight = JoinSet::new();
+                    for agent_id in agent_ids.iter().copied() {
+                        let permit_pool = Arc::clone(&semaphore);
+                        let orchestrator = tick_orchestrator.clone();
+                        let memory_service = Arc::clone(&tick_memory_service);
+                        in_flight.spawn(async move {
+                            let _permit = permit_pool
+                                .acquire_owned()
+                                .await
+                                .expect("tick concurrency semaphore should remain open");
+                            process_agent_tick(orchestrator, memory_service, agent_id).await;
+                        });
+                    }
 
-                                        if let Err(error) = tick_memory_service
-                                            .append_memory(
-                                                result.agent_id,
-                                                format!(
-                                                    "{} (mood={}, valence={:.2}, arousal={:.2})",
-                                                    result.action_summary,
-                                                    result.mood_label,
-                                                    result.valence,
-                                                    result.arousal
-                                                ),
-                                                0.7,
-                                            )
-                                            .await
-                                        {
-                                            tracing::error!(
-                                                agent_id = %result.agent_id,
-                                                error = %error,
-                                                "failed to append episodic memory from tick"
-                                            );
-                                        }
-                                    }
-                                    AgentTickExecutionStatus::AgentMissing => {
-                                        tracing::warn!(
-                                            agent_id = %result.agent_id,
-                                            tick_id = %result.tick_id,
-                                            "agent not found for tick"
-                                        );
-                                    }
-                                }
-                            }
-                            Ok(AgentTickOrchestratorOutcome::SkippedBusy) => {
-                                tracing::debug!(agent_id = %agent_id, "skipped busy agent tick");
-                            }
-                            Ok(AgentTickOrchestratorOutcome::SkippedDuplicate) => {
-                                tracing::debug!(agent_id = %agent_id, "skipped duplicate agent tick");
-                            }
-                            Err(error) => {
-                                tracing::error!(agent_id = %agent_id, error = %error, "agent tick failed");
-                            }
+                    while let Some(joined) = in_flight.join_next().await {
+                        if let Err(error) = joined {
+                            tracing::error!(error = %error, "agent tick task panicked");
                         }
                     }
                 }
@@ -179,6 +149,8 @@ async fn main() -> anyhow::Result<()> {
                                     processed = summary.processed,
                                     succeeded = summary.succeeded,
                                     failed = summary.failed,
+                                    retried = summary.retried,
+                                    dead_lettered = summary.dead_lettered,
                                     "memory embeddings processed"
                                 );
                             }
@@ -234,4 +206,61 @@ async fn main() -> anyhow::Result<()> {
     });
 
     runtime.run_until_shutdown().await
+}
+
+async fn process_agent_tick(
+    tick_orchestrator: AgentTickOrchestrator,
+    tick_memory_service: Arc<MemoryService>,
+    agent_id: Uuid,
+) {
+    match tick_orchestrator.run_agent_tick(agent_id, None).await {
+        Ok(AgentTickOrchestratorOutcome::Executed(result)) => match result.status {
+            AgentTickExecutionStatus::Applied => {
+                tracing::info!(
+                    agent_id = %result.agent_id,
+                    tick_id = %result.tick_id,
+                    event_id = ?result.event_id,
+                    mood = %result.mood_label,
+                    "agent tick applied"
+                );
+
+                if let Err(error) = tick_memory_service
+                    .append_memory(
+                        result.agent_id,
+                        format!(
+                            "{} (mood={}, valence={:.2}, arousal={:.2})",
+                            result.action_summary,
+                            result.mood_label,
+                            result.valence,
+                            result.arousal
+                        ),
+                        0.7,
+                    )
+                    .await
+                {
+                    tracing::error!(
+                        agent_id = %result.agent_id,
+                        error = %error,
+                        "failed to append episodic memory from tick"
+                    );
+                }
+            }
+            AgentTickExecutionStatus::AgentMissing => {
+                tracing::warn!(
+                    agent_id = %result.agent_id,
+                    tick_id = %result.tick_id,
+                    "agent not found for tick"
+                );
+            }
+        },
+        Ok(AgentTickOrchestratorOutcome::SkippedBusy) => {
+            tracing::debug!(agent_id = %agent_id, "skipped busy agent tick");
+        }
+        Ok(AgentTickOrchestratorOutcome::SkippedDuplicate) => {
+            tracing::debug!(agent_id = %agent_id, "skipped duplicate agent tick");
+        }
+        Err(error) => {
+            tracing::error!(agent_id = %agent_id, error = %error, "agent tick failed");
+        }
+    }
 }

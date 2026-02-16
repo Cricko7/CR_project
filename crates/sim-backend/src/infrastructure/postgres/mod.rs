@@ -3,8 +3,8 @@ mod memory_repository;
 
 use std::time::Duration;
 
-use anyhow::{Context, Result};
 pub use agent_core_repository::PostgresAgentCoreRepository;
+use anyhow::{Context, Result};
 pub use memory_repository::PostgresMemoryRepository;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
@@ -16,11 +16,11 @@ pub async fn connect_pool(config: &DatabaseConfig) -> Result<PgPool> {
     tokio::time::timeout(
         config.connect_timeout,
         PgPoolOptions::new()
-        .max_connections(config.max_connections)
-        .acquire_timeout(config.acquire_timeout)
-        .idle_timeout(Some(config.idle_timeout))
-        .max_lifetime(Some(config.max_lifetime))
-        .connect(&config.url),
+            .max_connections(config.max_connections)
+            .acquire_timeout(config.acquire_timeout)
+            .idle_timeout(Some(config.idle_timeout))
+            .max_lifetime(Some(config.max_lifetime))
+            .connect(&config.url),
     )
     .await
     .context("timed out while connecting to PostgreSQL")?

@@ -148,13 +148,16 @@ struct GeminiGenerateRequest {
 
 impl From<LlmGenerateRequest> for GeminiGenerateRequest {
     fn from(value: LlmGenerateRequest) -> Self {
-        let system_instruction = value.system_prompt.map(|system_prompt| GeminiSystemInstruction {
-            parts: vec![GeminiPart {
-                text: Some(system_prompt),
-            }],
-        });
+        let system_instruction = value
+            .system_prompt
+            .map(|system_prompt| GeminiSystemInstruction {
+                parts: vec![GeminiPart {
+                    text: Some(system_prompt),
+                }],
+            });
 
-        let generation_config = if value.temperature.is_some() || value.max_output_tokens.is_some() {
+        let generation_config = if value.temperature.is_some() || value.max_output_tokens.is_some()
+        {
             Some(GeminiGenerationConfig {
                 temperature: value.temperature,
                 max_output_tokens: value.max_output_tokens,

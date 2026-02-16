@@ -8,5 +8,6 @@ pub use orchestrator::{
 };
 pub use persistence::{
     AgentCoreRepository, AgentEventRecord, AgentRecord, AgentStateRecord, NewAgentEvent,
+    TickLeaseAcquireResult,
 };
 pub use tick_runner::{AgentTickRunner, TickRunOutcome};
