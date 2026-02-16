@@ -1,7 +1,13 @@
 FROM node:20-alpine AS builder
+
 WORKDIR /app
+
+# УСТАНОВИ TypeScript глобально + node-gyp для нативных модулей
+RUN npm install -g typescript @types/node
+
 COPY package*.json ./
 RUN npm ci
+
 COPY . .
 RUN npm run build
 
