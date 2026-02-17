@@ -46,6 +46,8 @@ const DEFAULT_OPENROUTER_TIMEOUT_MS: u64 = 15_000;
 const DEFAULT_OPENROUTER_MAX_RETRIES: u32 = 2;
 const DEFAULT_OPENROUTER_RETRY_BACKOFF_MS: u64 = 300;
 const DEFAULT_OPENROUTER_REASONING_ENABLED: bool = false;
+const DEFAULT_OPENROUTER_MIN_REQUEST_INTERVAL_MS: u64 = 15_000;
+const OPENROUTER_GPT_OSS_120B_MODEL: &str = "openai/gpt-oss-120b:free";
 const DEFAULT_QDRANT_URL: &str = "http://localhost:6333";
 const DEFAULT_QDRANT_COLLECTION: &str = "agent_memories";
 const DEFAULT_QDRANT_TIMEOUT_MS: u64 = 5_000;
@@ -95,6 +97,7 @@ pub struct OpenRouterConfig {
     pub max_retries: u32,
     pub retry_backoff: Duration,
     pub reasoning_enabled: bool,
+    pub min_request_interval: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -569,6 +572,16 @@ fn load_openrouter_config() -> Result<Option<OpenRouterConfig>, ConfigError> {
         "OPENROUTER_REASONING_ENABLED",
         DEFAULT_OPENROUTER_REASONING_ENABLED,
     )?;
+    let min_request_interval_ms: u64 = parse_env(
+        "OPENROUTER_MIN_REQUEST_INTERVAL_MS",
+        DEFAULT_OPENROUTER_MIN_REQUEST_INTERVAL_MS,
+    )?;
+    let min_request_interval_ms = if model.trim().eq_ignore_ascii_case(OPENROUTER_GPT_OSS_120B_MODEL)
+    {
+        min_request_interval_ms.max(15_000)
+    } else {
+        min_request_interval_ms
+    };
 
     if model.trim().is_empty() {
         return Err(ConfigError::invalid(
@@ -603,6 +616,7 @@ fn load_openrouter_config() -> Result<Option<OpenRouterConfig>, ConfigError> {
         max_retries,
         retry_backoff: Duration::from_millis(retry_backoff_ms),
         reasoning_enabled,
+        min_request_interval: Duration::from_millis(min_request_interval_ms),
     }))
 }
 

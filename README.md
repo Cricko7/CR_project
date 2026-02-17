@@ -1038,6 +1038,7 @@ Payload в point:
 | `OPENROUTER_MAX_RETRIES` | `2` |
 | `OPENROUTER_RETRY_BACKOFF_MS` | `300` |
 | `OPENROUTER_REASONING_ENABLED` | `false` |
+| `OPENROUTER_MIN_REQUEST_INTERVAL_MS` | `15000` |
 
 Поведение:
 - если настроены и Gemini, и OpenRouter: Gemini используется как primary, при ошибке запроса (429/5xx/transport) автоматически вызывается OpenRouter;
@@ -1167,6 +1168,7 @@ set WORKER_MESSAGE_BATCH_SIZE=32
 set GEMINI_API_KEY=<your_google_api_key>
 set GEMINI_MIN_REQUEST_INTERVAL_MS=1000
 set OPENROUTER_API_KEY=<your_openrouter_api_key>
+set OPENROUTER_MIN_REQUEST_INTERVAL_MS=15000
 ```
 
 Если заданы `GEMINI_API_KEY` и `OPENROUTER_API_KEY`:
@@ -1181,6 +1183,10 @@ set OPENROUTER_API_KEY=<your_openrouter_api_key>
 
 `GEMINI_MIN_REQUEST_INTERVAL_MS` задает минимальный интервал между Gemini запросами
 в рамках одного процесса (API или worker). Установите `0`, чтобы отключить throttling.
+
+`OPENROUTER_MIN_REQUEST_INTERVAL_MS` задает минимальный интервал между запросами к OpenRouter
+в рамках одного процесса (API или worker). Для модели `openai/gpt-oss-120b:free` значение
+принудительно не может быть ниже `15000` мс.
 
 ### 11.4 Запуск сервисов
 

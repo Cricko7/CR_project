@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -8,12 +9,16 @@ use serde_json::Value;
 use tokio::time::sleep;
 
 use crate::app::config::OpenRouterConfig;
+use crate::infrastructure::openrouter_rate_limiter::{
+    OpenRouterRateLimiter, shared_openrouter_rate_limiter,
+};
 use crate::llm::{LlmGenerateRequest, LlmGenerateResponse, LlmPort};
 
 #[derive(Clone)]
 pub struct OpenRouterClient {
     config: OpenRouterConfig,
     http: Client,
+    rate_limiter: Arc<OpenRouterRateLimiter>,
 }
 
 impl OpenRouterClient {
@@ -22,7 +27,12 @@ impl OpenRouterClient {
             .timeout(config.timeout)
             .build()
             .context("failed to build HTTP client for OpenRouter")?;
-        Ok(Self { config, http })
+        let rate_limiter = shared_openrouter_rate_limiter(config.min_request_interval);
+        Ok(Self {
+            config,
+            http,
+            rate_limiter,
+        })
     }
 
     fn endpoint(&self) -> String {
@@ -49,6 +59,7 @@ impl LlmPort for OpenRouterClient {
         let mut last_error: Option<anyhow::Error> = None;
 
         for attempt in 0..=self.config.max_retries {
+            self.rate_limiter.wait_turn().await;
             let response = self
                 .http
                 .post(&endpoint)
