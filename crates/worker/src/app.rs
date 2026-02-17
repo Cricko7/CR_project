@@ -15,11 +15,12 @@ use sim_backend::app::observability::init_tracing;
 use sim_backend::app::runtime::ServiceRuntime;
 use sim_backend::infrastructure::gemini::GeminiClient;
 use sim_backend::infrastructure::gemini_embedding::GeminiEmbeddingClient;
+use sim_backend::infrastructure::openrouter::OpenRouterClient;
 use sim_backend::infrastructure::postgres::{
     PostgresAgentCoreRepository, PostgresMemoryRepository, ensure_ready,
 };
 use sim_backend::infrastructure::qdrant::QdrantVectorStore;
-use sim_backend::llm::LlmPort;
+use sim_backend::llm::{FallbackLlm, LlmPort};
 use sim_backend::memory::{
     MemoryRepository, MemoryService, MemoryVectorStore, SimpleHashEmbedder, TextEmbedder,
 };
@@ -49,8 +50,35 @@ pub async fn run() -> anyhow::Result<()> {
             tracing::info!(model = %gemini_config.model, "gemini client configured");
             Some(Arc::new(GeminiClient::new(gemini_config)?) as Arc<dyn LlmPort>)
         }
-        None => {
-            tracing::warn!("GEMINI_API_KEY is not set; worker runs without llm integration");
+        None => None,
+    };
+    let openrouter_client: Option<Arc<dyn LlmPort>> = match config.openrouter.clone() {
+        Some(openrouter_config) => {
+            tracing::info!(model = %openrouter_config.model, "openrouter client configured");
+            Some(Arc::new(OpenRouterClient::new(openrouter_config)?) as Arc<dyn LlmPort>)
+        }
+        None => None,
+    };
+    let llm_client: Option<Arc<dyn LlmPort>> = match (gemini_client, openrouter_client) {
+        (Some(gemini), Some(openrouter)) => {
+            tracing::info!("gemini primary llm with openrouter fallback configured");
+            Some(
+                Arc::new(FallbackLlm::new(gemini, openrouter, "gemini", "openrouter"))
+                    as Arc<dyn LlmPort>,
+            )
+        }
+        (Some(gemini), None) => {
+            tracing::info!("openrouter is not configured; gemini is used as the only llm");
+            Some(gemini)
+        }
+        (None, Some(openrouter)) => {
+            tracing::warn!("GEMINI_API_KEY is not set; openrouter is used as primary llm");
+            Some(openrouter)
+        }
+        (None, None) => {
+            tracing::warn!(
+                "GEMINI_API_KEY and OPENROUTER_API_KEY are not set; worker runs without llm integration"
+            );
             None
         }
     };
@@ -68,14 +96,13 @@ pub async fn run() -> anyhow::Result<()> {
         memory_repository,
         vector_store,
         embedder,
-        gemini_client.clone(),
+        llm_client.clone(),
         config.qdrant.vector_size as usize,
     ));
 
     let postgres_agent_repository = Arc::new(PostgresAgentCoreRepository::new(db_pool));
     let repository: Arc<dyn AgentCoreRepository> = postgres_agent_repository.clone();
-    let orchestrator =
-        AgentTickOrchestrator::new(repository.clone()).with_optional_llm(gemini_client);
+    let orchestrator = AgentTickOrchestrator::new(repository.clone()).with_optional_llm(llm_client);
 
     let mut runtime = ServiceRuntime::new(
         config.common.service_name.clone(),

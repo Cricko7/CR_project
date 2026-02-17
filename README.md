@@ -9,7 +9,7 @@ Backend для симуляции мира автономных AI-агенто�
 - у агентов есть личность, состояние настроения, память;
 - агенты выполняют "тики жизни" и порождают события;
 - память хранится в PostgreSQL + векторно индексируется в Qdrant;
-- для генерации действий/суммаризации используется **Google Gemini API** (с fallback-режимом без LLM);
+- для генерации действий/суммаризации используется **Google Gemini API** с автоматическим runtime fallback на **OpenRouter**;
 - есть HTTP API + WebSocket-стрим событий.
 
 Проект сейчас сфокусирован на backend-ядре. Полноценный web-frontend в этом репозитории **не реализован**.
@@ -43,11 +43,13 @@ flowchart LR
     Admin[Admin/User UI] -->|HTTP + WebSocket| API[API Service - Axum]
     API -->|SQL| PG[(PostgreSQL)]
     API -->|Vector Search/Upsert| QD[(Qdrant)]
-    API -->|LLM + Embeddings| GEM[Google Gemini API]
+    API -->|Primary LLM + Embeddings| GEM[Google Gemini API]
+    API -->|LLM fallback| OR[OpenRouter]
 
     Worker[Background Worker] -->|SQL| PG
     Worker -->|Vector Upsert/Search| QD
-    Worker -->|LLM + Embeddings| GEM
+    Worker -->|Primary LLM + Embeddings| GEM
+    Worker -->|LLM fallback| OR
 ```
 
 ### 3.2 Контейнеры (C4 Level 2)
@@ -65,6 +67,7 @@ flowchart TB
     CoreLib --> PG[(PostgreSQL)]
     CoreLib --> QD[(Qdrant)]
     CoreLib --> GEM[Gemini API]
+    CoreLib --> OR[OpenRouter API]
 ```
 
 ### 3.3 Компоненты AgentCore (C4 Level 3)
@@ -156,7 +159,7 @@ flowchart LR
 | Runtime | Tokio |
 | DB | PostgreSQL (`sqlx`) |
 | Vector DB | Qdrant (HTTP API) |
-| LLM | Google Gemini API |
+| LLM | Google Gemini API (primary) + OpenRouter (auto fallback) |
 | Embeddings | Gemini embeddings (`text-embedding-004` по умолчанию) или локальный hash fallback |
 | Логи | tracing + tracing-subscriber (JSON) |
 | Graceful shutdown | custom `ServiceRuntime` + cancellation token |
@@ -195,7 +198,7 @@ CR_project/
 │           ├── app/                # config, runtime, observability
 │           ├── agent_core/         # orchestrator, persistence traits, tick runner
 │           ├── memory/             # memory service + ports
-│           ├── infrastructure/     # postgres, qdrant, gemini adapters
+│           ├── infrastructure/     # postgres, qdrant, gemini, openrouter adapters
 │           ├── llm/                # LLM port
 │           └── lib.rs
 |
@@ -1015,7 +1018,7 @@ Payload в point:
 
 | Variable | Default |
 |---|---|
-| `GEMINI_API_KEY` | empty -> LLM disabled |
+| `GEMINI_API_KEY` | empty -> Gemini disabled |
 | `GEMINI_MODEL` | `gemini-2.0-flash` |
 | `GEMINI_EMBED_MODEL` | `text-embedding-004` |
 | `GEMINI_BASE_URL` | `https://generativelanguage.googleapis.com` |
@@ -1024,7 +1027,24 @@ Payload в point:
 | `GEMINI_RETRY_BACKOFF_MS` | `300` |
 | `GEMINI_MIN_REQUEST_INTERVAL_MS` | `1000` |
 
-### 10.5 Qdrant
+### 10.5 OpenRouter (LLM fallback)
+
+| Variable | Default |
+|---|---|
+| `OPENROUTER_API_KEY` | empty -> OpenRouter disabled |
+| `OPENROUTER_MODEL` | `openai/gpt-oss-120b:free` |
+| `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` |
+| `OPENROUTER_TIMEOUT_MS` | `15000` |
+| `OPENROUTER_MAX_RETRIES` | `2` |
+| `OPENROUTER_RETRY_BACKOFF_MS` | `300` |
+| `OPENROUTER_REASONING_ENABLED` | `false` |
+
+Поведение:
+- если настроены и Gemini, и OpenRouter: Gemini используется как primary, при ошибке запроса (429/5xx/transport) автоматически вызывается OpenRouter;
+- если Gemini недоступен на конкретном запросе, fallback выполняется в том же тике с тем же prompt-контекстом (включая уже извлеченные данные памяти/recall);
+- если задан только `OPENROUTER_API_KEY`, OpenRouter используется как основной LLM.
+
+### 10.6 Qdrant
 
 | Variable | Default |
 |---|---|
@@ -1034,7 +1054,7 @@ Payload в point:
 | `QDRANT_VECTOR_SIZE` | `768` |
 | `QDRANT_TIMEOUT_MS` | `5000` |
 
-### 10.6 Memory workers
+### 10.7 Memory workers
 
 | Variable | Default |
 |---|---|
@@ -1044,7 +1064,7 @@ Payload в point:
 | `MEMORY_EMBED_INTERVAL_MS` | `5000` |
 | `MEMORY_SUMMARY_INTERVAL_MS` | `30000` |
 
-### 10.7 Worker
+### 10.8 Worker
 
 | Variable | Default |
 |---|---|
@@ -1100,7 +1120,7 @@ docker compose down -v
 ### 11.1 Prerequisites
 - Rust stable toolchain;
 - Docker (для Postgres + Qdrant);
-- доступ к Google Gemini API key (опционально, но нужен для LLM режима).
+- доступ к Google Gemini API key и/или OpenRouter API key (опционально, но нужен для LLM режима).
 
 ### 11.2 Поднять инфраструктуру
 
@@ -1130,9 +1150,16 @@ set WORKER_MESSAGE_INTERVAL_MS=1000
 set WORKER_MESSAGE_BATCH_SIZE=32
 set GEMINI_API_KEY=<your_google_api_key>
 set GEMINI_MIN_REQUEST_INTERVAL_MS=1000
+set OPENROUTER_API_KEY=<your_openrouter_api_key>
 ```
 
-Если `GEMINI_API_KEY` не задан, система работает в fallback-режиме:
+Если заданы `GEMINI_API_KEY` и `OPENROUTER_API_KEY`:
+- Gemini работает как primary LLM;
+- при недоступности Gemini запрос автоматически уходит в OpenRouter.
+
+Если задан только `OPENROUTER_API_KEY`, OpenRouter используется как основной LLM.
+
+Если не заданы оба ключа (`GEMINI_API_KEY` и `OPENROUTER_API_KEY`), система работает в fallback-режиме:
 - tick summaries deterministic;
 - embeddings через local hash embedder.
 

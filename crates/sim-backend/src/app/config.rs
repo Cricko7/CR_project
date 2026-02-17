@@ -40,6 +40,12 @@ const DEFAULT_GEMINI_MAX_RETRIES: u32 = 2;
 const DEFAULT_GEMINI_RETRY_BACKOFF_MS: u64 = 300;
 const DEFAULT_GEMINI_MIN_REQUEST_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_GEMINI_EMBED_MODEL: &str = "text-embedding-004";
+const DEFAULT_OPENROUTER_MODEL: &str = "openai/gpt-oss-120b:free";
+const DEFAULT_OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
+const DEFAULT_OPENROUTER_TIMEOUT_MS: u64 = 15_000;
+const DEFAULT_OPENROUTER_MAX_RETRIES: u32 = 2;
+const DEFAULT_OPENROUTER_RETRY_BACKOFF_MS: u64 = 300;
+const DEFAULT_OPENROUTER_REASONING_ENABLED: bool = false;
 const DEFAULT_QDRANT_URL: &str = "http://localhost:6333";
 const DEFAULT_QDRANT_COLLECTION: &str = "agent_memories";
 const DEFAULT_QDRANT_TIMEOUT_MS: u64 = 5_000;
@@ -81,6 +87,17 @@ pub struct GeminiConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct OpenRouterConfig {
+    pub api_key: String,
+    pub model: String,
+    pub base_url: String,
+    pub timeout: Duration,
+    pub max_retries: u32,
+    pub retry_backoff: Duration,
+    pub reasoning_enabled: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct QdrantConfig {
     pub url: String,
     pub api_key: Option<String>,
@@ -105,6 +122,7 @@ pub struct ApiConfig {
     pub qdrant: QdrantConfig,
     pub memory: MemoryConfig,
     pub gemini: Option<GeminiConfig>,
+    pub openrouter: Option<OpenRouterConfig>,
     pub host: IpAddr,
     pub port: u16,
     pub event_bridge_interval: Duration,
@@ -122,6 +140,7 @@ impl ApiConfig {
         let qdrant = load_qdrant_config()?;
         let memory = load_memory_config()?;
         let gemini = load_gemini_config()?;
+        let openrouter = load_openrouter_config()?;
         let host_raw: String = parse_env("API_HOST", DEFAULT_HOST.to_owned())?;
         let host = host_raw
             .parse::<IpAddr>()
@@ -192,6 +211,7 @@ impl ApiConfig {
             qdrant,
             memory,
             gemini,
+            openrouter,
             host,
             port,
             event_bridge_interval: Duration::from_millis(event_bridge_interval_ms),
@@ -215,6 +235,7 @@ pub struct WorkerConfig {
     pub qdrant: QdrantConfig,
     pub memory: MemoryConfig,
     pub gemini: Option<GeminiConfig>,
+    pub openrouter: Option<OpenRouterConfig>,
     pub agent_ids: Vec<Uuid>,
     pub tick_interval: Duration,
     pub tick_concurrency: u32,
@@ -235,6 +256,7 @@ impl WorkerConfig {
         let qdrant = load_qdrant_config()?;
         let memory = load_memory_config()?;
         let gemini = load_gemini_config()?;
+        let openrouter = load_openrouter_config()?;
         let agent_ids = parse_uuid_list_env("WORKER_AGENT_IDS")?;
         let tick_interval_ms: u64 =
             parse_env("WORKER_TICK_INTERVAL_MS", DEFAULT_WORKER_TICK_INTERVAL_MS)?;
@@ -343,6 +365,7 @@ impl WorkerConfig {
             qdrant,
             memory,
             gemini,
+            openrouter,
             agent_ids,
             tick_interval: Duration::from_millis(tick_interval_ms),
             tick_concurrency,
@@ -520,6 +543,66 @@ fn load_gemini_config() -> Result<Option<GeminiConfig>, ConfigError> {
         max_retries,
         retry_backoff: Duration::from_millis(retry_backoff_ms),
         min_request_interval: Duration::from_millis(min_request_interval_ms),
+    }))
+}
+
+fn load_openrouter_config() -> Result<Option<OpenRouterConfig>, ConfigError> {
+    let api_key = env::var("OPENROUTER_API_KEY")
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_default();
+    if api_key.is_empty() {
+        return Ok(None);
+    }
+
+    let model: String = parse_env("OPENROUTER_MODEL", DEFAULT_OPENROUTER_MODEL.to_owned())?;
+    let base_url: String = parse_env(
+        "OPENROUTER_BASE_URL",
+        DEFAULT_OPENROUTER_BASE_URL.to_owned(),
+    )?;
+    let timeout_ms: u64 = parse_env("OPENROUTER_TIMEOUT_MS", DEFAULT_OPENROUTER_TIMEOUT_MS)?;
+    let max_retries: u32 = parse_env("OPENROUTER_MAX_RETRIES", DEFAULT_OPENROUTER_MAX_RETRIES)?;
+    let retry_backoff_ms: u64 = parse_env(
+        "OPENROUTER_RETRY_BACKOFF_MS",
+        DEFAULT_OPENROUTER_RETRY_BACKOFF_MS,
+    )?;
+    let reasoning_enabled: bool = parse_env(
+        "OPENROUTER_REASONING_ENABLED",
+        DEFAULT_OPENROUTER_REASONING_ENABLED,
+    )?;
+
+    if model.trim().is_empty() {
+        return Err(ConfigError::invalid(
+            "OPENROUTER_MODEL",
+            "must not be empty",
+        ));
+    }
+    if base_url.trim().is_empty() {
+        return Err(ConfigError::invalid(
+            "OPENROUTER_BASE_URL",
+            "must not be empty",
+        ));
+    }
+    if timeout_ms == 0 {
+        return Err(ConfigError::invalid(
+            "OPENROUTER_TIMEOUT_MS",
+            "must be greater than 0",
+        ));
+    }
+    if retry_backoff_ms == 0 {
+        return Err(ConfigError::invalid(
+            "OPENROUTER_RETRY_BACKOFF_MS",
+            "must be greater than 0",
+        ));
+    }
+
+    Ok(Some(OpenRouterConfig {
+        api_key,
+        model,
+        base_url,
+        timeout: Duration::from_millis(timeout_ms),
+        max_retries,
+        retry_backoff: Duration::from_millis(retry_backoff_ms),
+        reasoning_enabled,
     }))
 }
 
