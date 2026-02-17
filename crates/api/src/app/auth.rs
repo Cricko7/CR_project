@@ -226,10 +226,11 @@ pub(super) enum AuthRepoError {
 }
 
 pub(super) fn map_auth_repo_error(error: sqlx::Error) -> AuthRepoError {
-    if let sqlx::Error::Database(database_error) = &error {
-        if database_error.code().as_deref() == Some("23505") {
-            return AuthRepoError::EmailTaken;
-        }
+    if let sqlx::Error::Database(database_error) = &error
+        && database_error.code().as_deref() == Some("23505")
+    {
+        return AuthRepoError::EmailTaken;
     }
+
     AuthRepoError::Other(anyhow::Error::from(error))
 }
