@@ -2,7 +2,7 @@ import * as React from 'react';
 import { cn } from '../../lib/cn';
 
 export const Input = React.forwardRef<HTMLInputElement, React.InputHTMLAttributes<HTMLInputElement>>(
-  ({ className, type = 'text', ...props }, ref) => (
+  ({ className, type = 'text', placeholder: _placeholder, ...props }, ref) => (
     <input
       ref={ref}
       type={type}

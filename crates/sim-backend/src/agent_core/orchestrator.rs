@@ -874,7 +874,7 @@ mod tests {
 
     use crate::agent_core::{
         AgentCoreRepository, AgentEventRecord, AgentRecord, AgentStateRecord,
-        DEFAULT_SIMULATION_TIME_SCALE, InterventionRecord, MessageRecord, NewAgentEvent,
+        DEFAULT_SIMULATION_TIME_SCALE, InterventionRecord, MessageRecord, NewAgent, NewAgentEvent,
         NewIntervention, NewMessage, RelationshipRecord, SimulationTimeScaleRecord,
         TickLeaseAcquireResult,
     };
@@ -967,6 +967,30 @@ mod tests {
 
     #[async_trait]
     impl AgentCoreRepository for InMemoryAgentCoreRepository {
+        async fn create_agent(&self, new_agent: &NewAgent) -> Result<AgentRecord> {
+            let agent = AgentRecord {
+                id: Uuid::new_v4(),
+                name: new_agent.name.clone(),
+                avatar_url: new_agent.avatar_url.clone(),
+                personality_json: new_agent.personality_json.clone(),
+                created_at: Utc::now(),
+            };
+            let mut agents = self.agents.lock().await;
+            agents.insert(agent.id, agent.clone());
+            let mut states = self.states.lock().await;
+            states.insert(
+                agent.id,
+                AgentStateRecord {
+                    agent_id: agent.id,
+                    valence: 0.0,
+                    arousal: 0.0,
+                    mood_label: "neutral".to_owned(),
+                    updated_at: Utc::now(),
+                },
+            );
+            Ok(agent)
+        }
+
         async fn get_agent(&self, agent_id: Uuid) -> Result<Option<AgentRecord>> {
             let agents = self.agents.lock().await;
             Ok(agents.get(&agent_id).cloned())

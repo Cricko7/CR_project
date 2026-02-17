@@ -1,5 +1,90 @@
 use super::*;
 
+pub(crate) async fn create_agent(
+    State(state): State<ApiState>,
+    Json(payload): Json<CreateAgentRequest>,
+) -> Result<(StatusCode, Json<CreateAgentResponse>), (StatusCode, Json<ApiErrorResponse>)> {
+    let name = payload.name.trim();
+    if name.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorResponse {
+                error: "invalid_agent_name",
+                message: "name must not be empty".to_owned(),
+            }),
+        ));
+    }
+
+    if name.chars().count() > 80 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorResponse {
+                error: "invalid_agent_name",
+                message: "name must be 80 characters or less".to_owned(),
+            }),
+        ));
+    }
+
+    let avatar_url = payload
+        .avatar_url
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let personality_json = payload.personality_json.unwrap_or_else(|| json!({}));
+    if !personality_json.is_object() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorResponse {
+                error: "invalid_personality_json",
+                message: "personality_json must be a JSON object".to_owned(),
+            }),
+        ));
+    }
+
+    let agent = state
+        .repository
+        .create_agent(&NewAgent {
+            name: name.to_owned(),
+            avatar_url,
+            personality_json: personality_json.clone(),
+        })
+        .await
+        .map_err(|error| {
+            internal_error(
+                "agent_create_failed",
+                format!("failed to create agent: {error}"),
+            )
+        })?;
+
+    if let Err(error) = state
+        .repository
+        .append_agent_event(&NewAgentEvent {
+            agent_id: Some(agent.id),
+            event_type: "agent.created".to_owned(),
+            description: format!("Agent `{}` created", agent.name),
+            payload_json: json!({
+                "agent_id": agent.id,
+                "name": agent.name,
+                "avatar_url": agent.avatar_url,
+                "personality_json": agent.personality_json,
+            }),
+        })
+        .await
+    {
+        tracing::warn!(agent_id = %agent.id, error = %error, "failed to append agent.created event");
+    }
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateAgentResponse {
+            id: agent.id,
+            name: agent.name,
+            avatar_url: agent.avatar_url,
+            personality_json: agent.personality_json,
+            created_at: agent.created_at.to_rfc3339(),
+        }),
+    ))
+}
+
 pub(crate) async fn trigger_agent_tick(
     State(state): State<ApiState>,
     Path(agent_id): Path<Uuid>,

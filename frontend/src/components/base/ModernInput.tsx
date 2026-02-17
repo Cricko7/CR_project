@@ -9,7 +9,7 @@ export interface ModernInputProps
 }
 
 export const ModernInput = forwardRef<HTMLInputElement, ModernInputProps>(
-  ({ className, id, inputClassName, label, placeholder = ' ', type = 'text', ...props }, ref) => {
+  ({ className, id, inputClassName, label, placeholder: _placeholder, type = 'text', ...props }, ref) => {
     const generatedId = useId();
     const inputId = id ?? generatedId;
 
@@ -19,7 +19,7 @@ export const ModernInput = forwardRef<HTMLInputElement, ModernInputProps>(
           ref={ref}
           id={inputId}
           type={type}
-          placeholder={placeholder}
+          placeholder=" "
           className={cn(
             'peer w-full rounded-2xl border border-white/10 bg-white/5 px-4 pb-3 pt-6 text-sm text-white',
             'outline-none backdrop-blur-xl transition-colors duration-200 placeholder:text-transparent',

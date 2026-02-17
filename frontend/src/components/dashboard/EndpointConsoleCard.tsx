@@ -45,14 +45,14 @@ const buildMockResponse = (endpoint: EndpointDefinition, body: string, timeScale
 
 export const EndpointConsoleCard = ({ endpoint, timeScale, onTimeScaleChange }: EndpointConsoleCardProps) => {
   const [status, setStatus] = useState<ExecutionStatus>('idle');
-  const [body, setBody] = useState(endpoint.defaultBody ?? '');
+  const [body, setBody] = useState('');
   const [response, setResponse] = useState(endpoint.sampleResponse);
   const [latencyMs, setLatencyMs] = useState<number | null>(null);
   const [activeWsEvent, setActiveWsEvent] = useState(endpoint.wsEvents?.[0] ?? '');
 
   const [paramValues, setParamValues] = useState<Record<string, string>>(() =>
     (endpoint.params ?? []).reduce<Record<string, string>>((acc, param) => {
-      acc[param.key] = param.defaultValue;
+      acc[param.key] = '';
       return acc;
     }, {})
   );
@@ -60,7 +60,7 @@ export const EndpointConsoleCard = ({ endpoint, timeScale, onTimeScaleChange }: 
   const resolvedPath = useMemo(() => {
     const pathParams = (endpoint.params ?? []).filter((param) => param.kind === 'path');
     return pathParams.reduce((path, param) => {
-      const value = paramValues[param.key] ?? param.defaultValue;
+      const value = paramValues[param.key] ?? '';
       return path.replace(`{${param.key}}`, value || `{${param.key}}`);
     }, endpoint.path);
   }, [endpoint.params, endpoint.path, paramValues]);
@@ -145,7 +145,6 @@ export const EndpointConsoleCard = ({ endpoint, timeScale, onTimeScaleChange }: 
                       [param.key]: event.target.value
                     }))
                   }
-                  placeholder={param.defaultValue}
                 />
               </div>
             ))}

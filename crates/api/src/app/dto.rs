@@ -56,6 +56,22 @@ pub(super) struct AgentStateResponse {
 }
 
 #[derive(Deserialize)]
+pub(super) struct CreateAgentRequest {
+    pub(super) name: String,
+    pub(super) avatar_url: Option<String>,
+    pub(super) personality_json: Option<Value>,
+}
+
+#[derive(Serialize)]
+pub(super) struct CreateAgentResponse {
+    pub(super) id: Uuid,
+    pub(super) name: String,
+    pub(super) avatar_url: Option<String>,
+    pub(super) personality_json: Value,
+    pub(super) created_at: String,
+}
+
+#[derive(Deserialize)]
 pub(super) struct AgentInspectorQuery {
     pub(super) events_limit: Option<u32>,
     pub(super) messages_limit: Option<u32>,

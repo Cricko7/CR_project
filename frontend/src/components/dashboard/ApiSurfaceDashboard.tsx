@@ -12,7 +12,7 @@ import type { EndpointCategory, Graph3DEdge, Graph3DNode } from './types';
 type CategoryFilter = 'all' | EndpointCategory;
 
 interface ActivityItem {
-  id: number;
+  id: string;
   text: string;
   at: string;
 }
@@ -48,6 +48,8 @@ type WsRelationshipsMessage =
   | { type: 'snapshot'; graph: RelationshipGraphDto }
   | { type: 'edge_updated'; edge: RelationshipGraphEdgeDto }
   | { type: 'error'; message: string };
+
+const ACTIVITY_STORAGE_KEY = 'cyberlife.dashboard.activity.timeline';
 
 const categoryEntries = Object.entries(CATEGORY_LABELS) as Array<[EndpointCategory, string]>;
 
@@ -95,10 +97,51 @@ const upsertEdge = (edges: Graph3DEdge[], incoming: Graph3DEdge) => {
   return edges.map((edge, index) => (index === idx ? incoming : edge));
 };
 
+const parseWsPayload = (raw: string) => {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  if (!(trimmed.startsWith('{') || trimmed.startsWith('['))) return null;
+  try {
+    return JSON.parse(trimmed) as unknown;
+  } catch {
+    return null;
+  }
+};
+
+const pickTimeScale = (payload: unknown) => {
+  if (!payload || typeof payload !== 'object') return null;
+  const record = payload as Record<string, unknown>;
+  const direct = record.time_scale ?? record.timeScale;
+  if (typeof direct === 'number' && Number.isFinite(direct)) return direct;
+  if (typeof direct === 'string') {
+    const parsed = Number(direct);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
+};
+
+const parseStoredActivity = (): ActivityItem[] => {
+  try {
+    const raw = window.localStorage.getItem(ACTIVITY_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((item): item is ActivityItem => {
+      if (!item || typeof item !== 'object') return false;
+      const record = item as Record<string, unknown>;
+      return typeof record.id === 'string' && typeof record.text === 'string' && typeof record.at === 'string';
+    });
+  } catch {
+    return [];
+  }
+};
+
 export const ApiSurfaceDashboard = () => {
   const { session, logout, refreshNow } = useAuth();
   const searchRef = useRef<HTMLInputElement | null>(null);
   const backendStateRef = useRef<boolean | null>(null);
+  const timeScaleSyncTimerRef = useRef<number | null>(null);
+  const activityIdRef = useRef(1);
 
   const [search, setSearch] = useState('');
   const [selectedCategory, setSelectedCategory] = useState<CategoryFilter>('all');
@@ -113,9 +156,11 @@ export const ApiSurfaceDashboard = () => {
   const [backendGraphLoaded, setBackendGraphLoaded] = useState(false);
   const [graphNodesLive, setGraphNodesLive] = useState<Graph3DNode[]>([]);
   const [graphEdgesLive, setGraphEdgesLive] = useState<Graph3DEdge[]>([]);
-  const [activity, setActivity] = useState<ActivityItem[]>([
-    { id: 1, text: 'Control deck is online', at: new Date().toLocaleTimeString() }
-  ]);
+  const [activity, setActivity] = useState<ActivityItem[]>(() => {
+    const restored = parseStoredActivity();
+    if (restored.length > 0) return restored;
+    return [{ id: 'boot-0', text: 'Control deck is online', at: new Date().toLocaleTimeString() }];
+  });
   const [streamStates, setStreamStates] = useState({
     events: true,
     relationships: true
@@ -124,8 +169,22 @@ export const ApiSurfaceDashboard = () => {
   const accessToken = session?.tokens.accessToken;
 
   const pushActivity = useCallback((text: string) => {
-    setActivity((prev) => [{ id: Date.now(), text, at: new Date().toLocaleTimeString() }, ...prev.slice(0, 29)]);
+    const nextId = `${Date.now()}-${activityIdRef.current}`;
+    activityIdRef.current += 1;
+    setActivity((prev) => [{ id: nextId, text, at: new Date().toLocaleTimeString() }, ...prev]);
   }, []);
+
+  const clearActivity = useCallback(() => {
+    setActivity(() => []);
+  }, []);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(ACTIVITY_STORAGE_KEY, JSON.stringify(activity));
+    } catch {
+      // Ignore storage quota/private mode failures.
+    }
+  }, [activity]);
 
   useEffect(() => {
     const timer = window.setInterval(() => setTimeLabel(new Date().toLocaleTimeString()), 1000);
@@ -198,6 +257,51 @@ export const ApiSurfaceDashboard = () => {
     }
   }, [accessToken, backendOnline, pushActivity]);
 
+  const applyTimeScale = useCallback(
+    (nextValue: number) => {
+      const next = Number(clamp(nextValue, 0.1, 10).toFixed(2));
+      setTimeScale(next);
+
+      if (!backendOnline) return;
+
+      if (timeScaleSyncTimerRef.current !== null) {
+        window.clearTimeout(timeScaleSyncTimerRef.current);
+      }
+
+      timeScaleSyncTimerRef.current = window.setTimeout(() => {
+        void requestJson<TimeScaleDto>({
+          path: '/simulation/time-scale',
+          method: 'POST',
+          body: { time_scale: next },
+          accessToken
+        })
+          .then((payload) => {
+            const synced = pickTimeScale(payload);
+            if (synced !== null) {
+              setTimeScale(Number(clamp(synced, 0.1, 10).toFixed(2)));
+            }
+          })
+          .catch((error) => {
+            if (isBackendUnavailableError(error)) {
+              setBackendOnline(false);
+              return;
+            }
+            pushActivity(`Time scale update failed: ${error instanceof Error ? error.message : 'unknown error'}`);
+          });
+      }, 300);
+    },
+    [accessToken, backendOnline, pushActivity]
+  );
+
+  useEffect(
+    () => () => {
+      if (timeScaleSyncTimerRef.current !== null) {
+        window.clearTimeout(timeScaleSyncTimerRef.current);
+      }
+    },
+    []
+  );
+
   const loadRelationshipGraph = useCallback(async () => {
     if (!backendOnline) return;
     try {
@@ -247,25 +351,23 @@ export const ApiSurfaceDashboard = () => {
 
       socket.onmessage = (event) => {
         const raw = typeof event.data === 'string' ? event.data : String(event.data);
-        try {
-          const message = JSON.parse(raw) as WsEventsMessage;
-          if (message.type === 'snapshot') {
-            pushActivity(`Events snapshot loaded: ${message.items.length}`);
-            return;
-          }
-          if (message.type === 'event_appended') {
-            pushActivity(`Event: ${message.item.event_type} (${message.item.agent_id.slice(0, 8)})`);
-            return;
-          }
-          if (message.type === 'tick_skipped') {
-            pushActivity(`Tick skipped (${message.agent_id.slice(0, 8)}): ${message.reason}`);
-            return;
-          }
-          if (message.type === 'error') {
-            pushActivity(`Events stream error: ${message.message}`);
-          }
-        } catch {
-          pushActivity('Events stream parse error');
+        const parsed = parseWsPayload(raw);
+        if (!parsed || typeof parsed !== 'object') return;
+        const message = parsed as WsEventsMessage;
+        if (message.type === 'snapshot') {
+          pushActivity(`Events snapshot loaded: ${message.items.length}`);
+          return;
+        }
+        if (message.type === 'event_appended') {
+          pushActivity(`Event: ${message.item.event_type} (${message.item.agent_id.slice(0, 8)})`);
+          return;
+        }
+        if (message.type === 'tick_skipped') {
+          pushActivity(`Tick skipped (${message.agent_id.slice(0, 8)}): ${message.reason}`);
+          return;
+        }
+        if (message.type === 'error') {
+          pushActivity(`Events stream error: ${message.message}`);
         }
       };
 
@@ -313,38 +415,36 @@ export const ApiSurfaceDashboard = () => {
 
       socket.onmessage = (event) => {
         const raw = typeof event.data === 'string' ? event.data : String(event.data);
-        try {
-          const message = JSON.parse(raw) as WsRelationshipsMessage;
-          if (message.type === 'snapshot') {
-            setGraphNodesLive(mapGraphNodes(message.graph.nodes));
-            setGraphEdgesLive(mapGraphEdges(message.graph.edges));
-            setBackendGraphLoaded(true);
-            pushActivity(`Relationship snapshot loaded: ${message.graph.edges.length} edges`);
-            return;
-          }
-          if (message.type === 'edge_updated') {
-            const nextEdge: Graph3DEdge = {
-              id: `edge-${message.edge.id}`,
-              source: message.edge.agent_a,
-              target: message.edge.agent_b,
-              affinity: clamp(message.edge.affinity_score, -1, 1)
-            };
-            setGraphEdgesLive((prev) => upsertEdge(prev, nextEdge));
-            setGraphNodesLive((prev) => {
-              const withA = ensureGraphNode(prev, message.edge.agent_a);
-              return ensureGraphNode(withA, message.edge.agent_b);
-            });
-            setBackendGraphLoaded(true);
-            pushActivity(
-              `Edge updated: ${message.edge.agent_a.slice(0, 6)} -> ${message.edge.agent_b.slice(0, 6)} (${message.edge.affinity_score.toFixed(2)})`
-            );
-            return;
-          }
-          if (message.type === 'error') {
-            pushActivity(`Relationship stream error: ${message.message}`);
-          }
-        } catch {
-          pushActivity('Relationship stream parse error');
+        const parsed = parseWsPayload(raw);
+        if (!parsed || typeof parsed !== 'object') return;
+        const message = parsed as WsRelationshipsMessage;
+        if (message.type === 'snapshot') {
+          setGraphNodesLive(mapGraphNodes(message.graph.nodes));
+          setGraphEdgesLive(mapGraphEdges(message.graph.edges));
+          setBackendGraphLoaded(true);
+          pushActivity(`Relationship snapshot loaded: ${message.graph.edges.length} edges`);
+          return;
+        }
+        if (message.type === 'edge_updated') {
+          const nextEdge: Graph3DEdge = {
+            id: `edge-${message.edge.id}`,
+            source: message.edge.agent_a,
+            target: message.edge.agent_b,
+            affinity: clamp(message.edge.affinity_score, -1, 1)
+          };
+          setGraphEdgesLive((prev) => upsertEdge(prev, nextEdge));
+          setGraphNodesLive((prev) => {
+            const withA = ensureGraphNode(prev, message.edge.agent_a);
+            return ensureGraphNode(withA, message.edge.agent_b);
+          });
+          setBackendGraphLoaded(true);
+          pushActivity(
+            `Edge updated: ${message.edge.agent_a.slice(0, 6)} -> ${message.edge.agent_b.slice(0, 6)} (${message.edge.affinity_score.toFixed(2)})`
+          );
+          return;
+        }
+        if (message.type === 'error') {
+          pushActivity(`Relationship stream error: ${message.message}`);
         }
       };
 
@@ -466,7 +566,6 @@ export const ApiSurfaceDashboard = () => {
                 ref={searchRef}
                 value={search}
                 onChange={(event) => setSearch(event.target.value)}
-                placeholder="find by operation name or intent..."
               />
             </div>
             <div className="space-y-1">
@@ -625,11 +724,11 @@ export const ApiSurfaceDashboard = () => {
                       max={10}
                       step={0.1}
                       value={[timeScale]}
-                      onValueChange={(values) => setTimeScale(Number((values[0] ?? timeScale).toFixed(2)))}
+                      onValueChange={(values) => applyTimeScale(values[0] ?? timeScale)}
                     />
                     <div className="grid grid-cols-6 gap-1">
                       {[0.1, 0.5, 1, 2, 5, 10].map((preset) => (
-                        <Button key={preset} size="sm" variant="outline" className="text-[11px]" onClick={() => setTimeScale(preset)}>
+                        <Button key={preset} size="sm" variant="outline" className="text-[11px]" onClick={() => applyTimeScale(preset)}>
                           {preset}x
                         </Button>
                       ))}
@@ -646,7 +745,7 @@ export const ApiSurfaceDashboard = () => {
                       <Button size="sm" variant="ghost" onClick={() => setActivityExpanded(true)}>
                         Open
                       </Button>
-                      <Button size="sm" variant="ghost" onClick={() => setActivity([])}>
+                      <Button size="sm" variant="ghost" onClick={clearActivity}>
                         Clear
                       </Button>
                     </div>
@@ -719,8 +818,10 @@ export const ApiSurfaceDashboard = () => {
 
       {graphExpanded ? (
         <div
-          className="fixed inset-0 z-[95] flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm"
-          onClick={() => setGraphExpanded(false)}
+          className="fixed inset-0 z-[95] flex items-center justify-center overflow-y-auto bg-black/75 p-4 backdrop-blur-sm"
+          onClick={(event) => {
+            if (event.target === event.currentTarget) setGraphExpanded(false);
+          }}
         >
           <GlassCard className="h-[92vh] w-[95vw] max-w-[1500px] p-4" onClick={(event) => event.stopPropagation()}>
             <div className="mb-3 flex items-center justify-between">
@@ -744,14 +845,25 @@ export const ApiSurfaceDashboard = () => {
 
       {activityExpanded ? (
         <div
-          className="fixed inset-0 z-[94] flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm"
-          onClick={() => setActivityExpanded(false)}
+          className="fixed inset-0 z-[94] flex items-center justify-center overflow-y-auto bg-black/70 p-4 backdrop-blur-sm"
+          onClick={(event) => {
+            if (event.target === event.currentTarget) setActivityExpanded(false);
+          }}
         >
-          <GlassCard className="flex h-[82vh] w-[95vw] max-w-[900px] flex-col p-4" onClick={(event) => event.stopPropagation()}>
+          <GlassCard
+            className="my-auto flex h-[82vh] max-h-[88vh] w-[95vw] max-w-[900px] min-h-0 flex-col overflow-hidden p-4"
+            onClick={(event) => event.stopPropagation()}
+          >
             <div className="mb-3 flex items-center justify-between">
               <h3 className="text-lg font-semibold text-white">Full Activity Timeline</h3>
               <div className="flex gap-2">
-                <Button variant="ghost" onClick={() => setActivity([])}>
+                <Button
+                  variant="ghost"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    clearActivity();
+                  }}
+                >
                   Clear
                 </Button>
                 <Button variant="ghost" onClick={() => setActivityExpanded(false)}>
@@ -759,7 +871,7 @@ export const ApiSurfaceDashboard = () => {
                 </Button>
               </div>
             </div>
-            <div className="dashboard-scroll min-h-0 flex-1 space-y-2 overflow-y-auto pr-1">
+            <div className="dashboard-scroll min-h-0 flex-1 space-y-2 overflow-y-auto overscroll-contain pr-1">
               {activity.length === 0 ? (
                 <Card className="border-dashed border-white/20 bg-slate-900/50">
                   <CardContent className="p-3 text-sm text-slate-300/80">No activity yet.</CardContent>

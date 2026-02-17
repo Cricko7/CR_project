@@ -1094,6 +1094,17 @@ Payload в point:
 docker compose up --build -d
 ```
 
+Windows-скрипты для удобного запуска:
+```bat
+copy docker-env.bat.example docker-env.bat
+docker-up.bat
+```
+
+Быстрый перезапуск после изменений (с пересборкой `api/worker/frontend`):
+```bat
+docker-restart.bat
+```
+
 Опционально для LLM fallback через OpenRouter перед запуском:
 ```bash
 set OPENROUTER_API_KEY=<your_openrouter_api_key>

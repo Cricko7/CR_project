@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 use sim_backend::agent_core::{
     AgentCoreRepository, AgentEventRecord, AgentTickExecutionStatus, AgentTickOrchestrator,
     AgentTickOrchestratorOutcome, InterventionRecord, MAX_SIMULATION_TIME_SCALE,
-    MIN_SIMULATION_TIME_SCALE, MessageRecord, NewAgentEvent, NewIntervention, NewMessage,
+    MIN_SIMULATION_TIME_SCALE, MessageRecord, NewAgent, NewAgentEvent, NewIntervention, NewMessage,
     RelationshipRecord, SimulationTimeScaleRecord,
 };
 use sim_backend::app::config::ApiConfig;
@@ -180,6 +180,7 @@ pub async fn run() -> anyhow::Result<()> {
         .route("/auth/register", post(auth_register))
         .route("/auth/login", post(auth_login))
         .route("/auth/refresh", post(auth_refresh))
+        .route("/agents", post(create_agent))
         .route("/agents/{id}/ticks", post(trigger_agent_tick))
         .route("/agents/{id}/state", get(get_agent_state))
         .route("/agents/{id}/inspector", get(get_agent_inspector))

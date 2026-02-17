@@ -20,6 +20,13 @@ pub struct AgentRecord {
 }
 
 #[derive(Debug, Clone)]
+pub struct NewAgent {
+    pub name: String,
+    pub avatar_url: Option<String>,
+    pub personality_json: Value,
+}
+
+#[derive(Debug, Clone)]
 pub struct AgentStateRecord {
     pub agent_id: Uuid,
     pub valence: f32,
@@ -108,6 +115,7 @@ pub enum TickLeaseAcquireResult {
 
 #[async_trait]
 pub trait AgentCoreRepository: Send + Sync {
+    async fn create_agent(&self, new_agent: &NewAgent) -> Result<AgentRecord>;
     async fn get_agent(&self, agent_id: Uuid) -> Result<Option<AgentRecord>>;
     async fn list_agents(&self, limit: u32) -> Result<Vec<AgentRecord>>;
     async fn get_agent_state(&self, agent_id: Uuid) -> Result<Option<AgentStateRecord>>;

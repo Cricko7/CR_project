@@ -36,7 +36,6 @@ interface CategoryOperationsModalProps {
 interface AgentInputProps {
   value: string;
   onChange: (next: string) => void;
-  placeholder?: string;
   className?: string;
   directory: AgentDirectoryEntry[];
 }
@@ -55,16 +54,8 @@ const parseDefaultFields = (endpoint: EndpointDefinition): ParsedBodyDefaults =>
   if (!endpoint.defaultBody) return { values: {}, template: {} };
   try {
     const parsed = JSON.parse(endpoint.defaultBody) as Record<string, unknown>;
-    const values = Object.entries(parsed).reduce<Record<string, string>>((acc, [key, value]) => {
-      if (typeof value === 'string') {
-        acc[key] = value;
-        return acc;
-      }
-      if (typeof value === 'number' || typeof value === 'boolean') {
-        acc[key] = String(value);
-        return acc;
-      }
-      acc[key] = JSON.stringify(value);
+    const values = Object.keys(parsed).reduce<Record<string, string>>((acc, key) => {
+      acc[key] = '';
       return acc;
     }, {});
 
@@ -94,7 +85,7 @@ const isAgentParam = (endpoint: EndpointDefinition, param: EndpointParam) => {
 
 const isAgentBodyKey = (key: string) => key.includes('agent') || key.endsWith('_id_agent');
 
-const AgentInput = ({ value, onChange, placeholder, className, directory }: AgentInputProps) => {
+const AgentInput = ({ value, onChange, className, directory }: AgentInputProps) => {
   const [displayValue, setDisplayValue] = useState(() => findAgentById(directory, value)?.name ?? value);
   const [open, setOpen] = useState(false);
 
@@ -112,7 +103,6 @@ const AgentInput = ({ value, onChange, placeholder, className, directory }: Agen
     <div className="relative">
       <Input
         value={displayValue}
-        placeholder={placeholder}
         className={className}
         onFocus={() => setOpen(true)}
         onBlur={() => {
@@ -150,7 +140,6 @@ const AgentInput = ({ value, onChange, placeholder, className, directory }: Agen
                 }}
               >
                 <span>{agent.name}</span>
-                <span className="text-[10px] text-slate-400">{agent.id}</span>
               </button>
             ))
           )}
@@ -170,6 +159,7 @@ const parseMaybeNumber = (value: unknown) => {
 };
 
 const coerceBodyValue = (raw: string, template: unknown): unknown => {
+  if (!raw.trim()) return template;
   if (typeof template === 'number') {
     const parsed = Number(raw);
     return Number.isFinite(parsed) ? parsed : template;
@@ -202,6 +192,211 @@ const pickTimeScale = (payload: unknown) => {
 
 const formatErrorMessage = (error: unknown) => (error instanceof Error ? error.message : 'Unexpected error');
 
+const asRecord = (value: unknown): Record<string, unknown> | null => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+};
+
+const asRecordArray = (value: unknown): Record<string, unknown>[] =>
+  Array.isArray(value) ? value.map(asRecord).filter((item): item is Record<string, unknown> => item !== null) : [];
+
+const readString = (record: Record<string, unknown>, key: string) =>
+  typeof record[key] === 'string' ? String(record[key]).trim() : '';
+
+const readNumber = (record: Record<string, unknown>, key: string) => parseMaybeNumber(record[key]);
+
+const truncate = (text: string, max = 180) => (text.length > max ? `${text.slice(0, max - 1)}...` : text);
+
+const bulletLines = (lines: string[]) => lines.map((line) => `• ${line}`).join('\n');
+
+const summarizeImportantResponse = (endpointId: string, payload: unknown): string | null => {
+  const root = asRecord(payload);
+
+  if (!root) {
+    if (typeof payload === 'string' && payload.trim().length > 0) return truncate(payload.trim(), 200);
+    return null;
+  }
+
+  if (endpointId === 'time-scale-set' || endpointId === 'time-scale-get') return null;
+
+  if (endpointId === 'list-messages' || endpointId === 'relationship-history') {
+    const items = asRecordArray(root.items);
+    const messages = items
+      .map((item) => readString(item, 'content'))
+      .filter((text) => text.length > 0)
+      .slice(0, 4)
+      .map((text) => truncate(text, 220));
+    if (messages.length > 0) return bulletLines(messages);
+    return items.length > 0 ? `Messages: ${items.length}` : null;
+  }
+
+  if (endpointId === 'memory-recall') {
+    const items = asRecordArray(root.items);
+    const memories = items
+      .map((item) => readString(item, 'content'))
+      .filter((text) => text.length > 0)
+      .slice(0, 4)
+      .map((text) => truncate(text, 220));
+    if (memories.length > 0) return bulletLines(memories);
+    return items.length > 0 ? `Matches: ${items.length}` : null;
+  }
+
+  if (endpointId === 'events') {
+    const items = asRecordArray(root.items);
+    const events = items
+      .map((item) => {
+        const description = readString(item, 'description');
+        if (description.length > 0) return description;
+        const eventType = readString(item, 'event_type');
+        return eventType.length > 0 ? eventType : '';
+      })
+      .filter((text) => text.length > 0)
+      .slice(0, 4)
+      .map((text) => truncate(text, 200));
+    if (events.length > 0) return bulletLines(events);
+    return items.length > 0 ? `Events: ${items.length}` : null;
+  }
+
+  if (endpointId === 'agent-state') {
+    const mood = readString(root, 'mood_label');
+    const valence = readNumber(root, 'valence');
+    const arousal = readNumber(root, 'arousal');
+    const lines = [
+      mood ? `Mood: ${mood}` : '',
+      valence !== null ? `Valence: ${valence.toFixed(2)}` : '',
+      arousal !== null ? `Arousal: ${arousal.toFixed(2)}` : ''
+    ].filter((line) => line.length > 0);
+    return lines.length > 0 ? lines.join('\n') : null;
+  }
+
+  if (endpointId === 'agent-create') {
+    const id = readString(root, 'id');
+    const name = readString(root, 'name');
+    const lines = [name ? `Created: ${name}` : '', id ? `ID: ${id}` : ''].filter((line) => line.length > 0);
+    return lines.length > 0 ? lines.join('\n') : 'Agent created';
+  }
+
+  if (endpointId === 'agent-inspector') {
+    const summary = asRecord(root.summary);
+    if (!summary) return null;
+    const eventsCount = readNumber(summary, 'events_count');
+    const messagesCount = readNumber(summary, 'messages_count');
+    const relationshipsCount = readNumber(summary, 'relationships_count');
+    const timelineCount = readNumber(summary, 'timeline_count');
+    const memoriesCount = readNumber(summary, 'memories_count');
+    const lines = [
+      eventsCount !== null ? `Events: ${eventsCount}` : '',
+      messagesCount !== null ? `Messages: ${messagesCount}` : '',
+      relationshipsCount !== null ? `Relationships: ${relationshipsCount}` : '',
+      timelineCount !== null ? `Timeline: ${timelineCount}` : '',
+      memoriesCount !== null ? `Memories: ${memoriesCount}` : ''
+    ].filter((line) => line.length > 0);
+    return lines.length > 0 ? lines.join('   |   ') : null;
+  }
+
+  if (endpointId === 'send-message') {
+    const id = readNumber(root, 'message_id');
+    const status = readString(root, 'status');
+    if (id !== null && status.length > 0) return `Message #${id} (${status})`;
+    if (id !== null) return `Message #${id}`;
+    return status.length > 0 ? status : null;
+  }
+
+  if (endpointId === 'relationships-graph') {
+    const nodes = asRecordArray(root.nodes);
+    const edges = asRecordArray(root.edges);
+    return `Graph nodes: ${nodes.length}\nGraph edges: ${edges.length}`;
+  }
+
+  if (endpointId === 'memory-append') {
+    const memoryId = readNumber(root, 'memory_id');
+    const status = readString(root, 'embedding_status');
+    if (memoryId !== null && status.length > 0) return `Memory #${memoryId}\nStatus: ${status}`;
+    if (memoryId !== null) return `Memory #${memoryId}`;
+    return status.length > 0 ? status : null;
+  }
+
+  if (endpointId === 'memory-summarize') {
+    const created = typeof root.created_summary === 'boolean' ? root.created_summary : null;
+    const count = readNumber(root, 'source_count');
+    const lines = [
+      created !== null ? `Created summary: ${created ? 'yes' : 'no'}` : '',
+      count !== null ? `Source entries: ${count}` : ''
+    ].filter((line) => line.length > 0);
+    return lines.length > 0 ? lines.join('\n') : null;
+  }
+
+  if (endpointId === 'memory-process-embeddings') {
+    const processed = readNumber(root, 'processed');
+    const succeeded = readNumber(root, 'succeeded');
+    const failed = readNumber(root, 'failed');
+    const lines = [
+      processed !== null ? `Processed: ${processed}` : '',
+      succeeded !== null ? `Succeeded: ${succeeded}` : '',
+      failed !== null ? `Failed: ${failed}` : ''
+    ].filter((line) => line.length > 0);
+    return lines.length > 0 ? lines.join('\n') : null;
+  }
+
+  if (endpointId === 'memory-dead-letter') {
+    const items = asRecordArray(root.items);
+    if (items.length === 0) return 'Dead-letter queue is empty';
+    return `Dead-letter items: ${items.length}`;
+  }
+
+  if (endpointId === 'memory-requeue') {
+    const memoryId = readNumber(root, 'memory_id');
+    const requeued = typeof root.requeued === 'boolean' ? root.requeued : null;
+    if (memoryId !== null && requeued !== null) return `Memory #${memoryId}: ${requeued ? 'requeued' : 'not requeued'}`;
+    if (memoryId !== null) return `Memory #${memoryId}`;
+    return null;
+  }
+
+  if (endpointId === 'ws-events') {
+    const type = readString(root, 'type');
+    if (!type) return null;
+    if (type === 'snapshot') {
+      const items = asRecordArray(root.items);
+      return `Events snapshot: ${items.length}`;
+    }
+    if (type === 'event_appended') {
+      const item = asRecord(root.item);
+      const eventType = item ? readString(item, 'event_type') : '';
+      const description = item ? readString(item, 'description') : '';
+      if (description) return description;
+      if (eventType) return `Event: ${eventType}`;
+    }
+    return `WS event: ${type}`;
+  }
+
+  if (endpointId === 'ws-relationships') {
+    const type = readString(root, 'type');
+    if (!type) return null;
+    if (type === 'snapshot') {
+      const graph = asRecord(root.graph);
+      const nodes = graph ? asRecordArray(graph.nodes) : [];
+      const edges = graph ? asRecordArray(graph.edges) : [];
+      return `Relationships snapshot\nNodes: ${nodes.length}\nEdges: ${edges.length}`;
+    }
+    if (type === 'edge_updated') {
+      const edge = asRecord(root.edge);
+      const source = edge ? readString(edge, 'agent_a') : '';
+      const target = edge ? readString(edge, 'agent_b') : '';
+      const affinity = edge ? readNumber(edge, 'affinity_score') : null;
+      if (source && target && affinity !== null) return `${source} -> ${target}\nAffinity: ${affinity.toFixed(2)}`;
+      return 'Relationship edge updated';
+    }
+    return `WS event: ${type}`;
+  }
+
+  if (endpointId === 'health' || endpointId === 'livez') {
+    const status = readString(root, 'status');
+    return status ? `Status: ${status}` : null;
+  }
+
+  return null;
+};
+
 const OperationCard = ({
   endpoint,
   timeScale,
@@ -214,12 +409,14 @@ const OperationCard = ({
 
   const [paramValues, setParamValues] = useState<Record<string, string>>(() =>
     (endpoint.params ?? []).reduce<Record<string, string>>((acc, param) => {
-      acc[param.key] = param.defaultValue;
+      acc[param.key] = '';
       return acc;
     }, {})
   );
   const [bodyFields, setBodyFields] = useState<Record<string, string>>(bodyDefaults.values);
   const [isRunning, setIsRunning] = useState(false);
+  const [lastSummary, setLastSummary] = useState<string | null>(null);
+  const [lastError, setLastError] = useState<string | null>(null);
 
   useEffect(() => {
     setBodyFields(bodyDefaults.values);
@@ -254,10 +451,12 @@ const OperationCard = ({
         const wsQuery: QueryParams = { ...queryParams };
         if (accessToken) wsQuery.access_token = accessToken;
 
-        await readSingleWebSocketEvent({
+        const wsPayload = await readSingleWebSocketEvent({
           path: resolvedPath,
           query: wsQuery
         });
+        setLastSummary(summarizeImportantResponse(endpoint.id, wsPayload));
+        setLastError(null);
         onRun(`${endpoint.title} connected via backend WS (${Math.round(performance.now() - started)} ms)`);
       } else {
         const payload = await requestJson<unknown>({
@@ -278,16 +477,22 @@ const OperationCard = ({
           }
         }
 
+        setLastSummary(summarizeImportantResponse(endpoint.id, payload));
+        setLastError(null);
         onRun(`${endpoint.title} applied via backend (${Math.round(performance.now() - started)} ms)`);
       }
     } catch (error) {
       if (isBackendUnavailableError(error)) {
         if (endpoint.id === 'time-scale-set') {
-          const raw = Number(bodyFields.time_scale ?? timeScale);
-          if (!Number.isNaN(raw)) onTimeScaleChange(Math.min(10, Math.max(0.1, raw)));
+          const raw = parseMaybeNumber(bodyFields.time_scale) ?? timeScale;
+          onTimeScaleChange(Math.min(10, Math.max(0.1, raw)));
         }
+        setLastSummary(null);
+        setLastError('Backend unavailable');
         onRun(`${endpoint.title} fallback mock: backend unavailable`);
       } else {
+        setLastSummary(null);
+        setLastError(formatErrorMessage(error));
         onRun(`${endpoint.title} failed: ${formatErrorMessage(error)}`);
       }
     } finally {
@@ -319,7 +524,6 @@ const OperationCard = ({
                         [param.key]: next
                       }))
                     }
-                    placeholder={param.defaultValue}
                     className="h-8 text-xs"
                     directory={agentDirectory}
                   />
@@ -332,7 +536,6 @@ const OperationCard = ({
                         [param.key]: event.target.value
                       }))
                     }
-                    placeholder={param.defaultValue}
                     className="h-8 text-xs"
                   />
                 )}
@@ -348,7 +551,7 @@ const OperationCard = ({
               min={0.1}
               max={10}
               step={0.1}
-              value={[Number(bodyFields.time_scale ?? timeScale)]}
+              value={[parseMaybeNumber(bodyFields.time_scale) ?? timeScale]}
               onValueChange={(values) => {
                 const next = Number((values[0] ?? timeScale).toFixed(2));
                 onTimeScaleChange(next);
@@ -392,9 +595,36 @@ const OperationCard = ({
           </div>
         ) : null}
 
-        <Button size="sm" onClick={runAction} disabled={isRunning}>
-          {isRunning ? 'Applying...' : 'Apply'}
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button size="sm" onClick={runAction} disabled={isRunning}>
+            {isRunning ? 'Applying...' : 'Apply'}
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => {
+              setLastSummary(null);
+              setLastError(null);
+            }}
+          >
+            Clear
+          </Button>
+        </div>
+
+        {lastError ? (
+          <div className="rounded-md border border-rose-500/40 bg-rose-950/40 px-3 py-2 text-xs text-rose-200">
+            {lastError}
+          </div>
+        ) : null}
+
+        {lastSummary ? (
+          <div className="space-y-1">
+            <Label>Result</Label>
+            <div className="rounded-md border border-cyan-400/20 bg-slate-900/70 px-4 py-3 text-base font-medium leading-6 text-slate-100 whitespace-pre-line">
+              {lastSummary}
+            </div>
+          </div>
+        ) : null}
       </CardContent>
     </Card>
   );
@@ -430,14 +660,16 @@ export const CategoryOperationsModal = ({
 
   return (
     <div
-      className="fixed inset-0 z-[100] flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm"
-      onClick={onClose}
+      className="fixed inset-0 z-[100] flex items-center justify-center overflow-y-auto bg-black/70 p-4 backdrop-blur-sm"
+      onClick={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
       role="dialog"
       aria-modal="true"
       aria-label={`${categoryLabel ?? category} operations`}
     >
       <div
-        className="panel-sheen flex max-h-[88vh] w-full max-w-5xl flex-col overflow-hidden rounded-2xl border border-white/15 bg-slate-950/95"
+        className="panel-sheen my-auto flex max-h-[88vh] w-full max-w-5xl flex-col overflow-hidden rounded-2xl border border-white/15 bg-slate-950/95"
         onClick={(event) => event.stopPropagation()}
       >
         <div className="flex items-center justify-between gap-4 p-5">
@@ -452,25 +684,22 @@ export const CategoryOperationsModal = ({
         <Separator />
         <div className="p-5 pb-3">
           <Label>Find operation</Label>
-          <Input
-            value={search}
-            onChange={(event) => setSearch(event.target.value)}
-            placeholder="search by title or intent..."
-            className="mt-1"
-          />
+          <Input value={search} onChange={(event) => setSearch(event.target.value)} className="mt-1" />
         </div>
-        <div className="dashboard-scroll grid gap-3 overflow-auto p-5 pt-2 md:grid-cols-2">
-          {filtered.map((endpoint) => (
-            <OperationCard
-              key={endpoint.id}
-              endpoint={endpoint}
-              timeScale={timeScale}
-              accessToken={accessToken}
-              agentDirectory={resolvedDirectory}
-              onTimeScaleChange={onTimeScaleChange}
-              onRun={onRun}
-            />
-          ))}
+        <div className="dashboard-scroll min-h-0 flex-1 overflow-y-auto overscroll-contain p-5 pt-2">
+          <div className="grid gap-3 md:grid-cols-2">
+            {filtered.map((endpoint) => (
+              <OperationCard
+                key={endpoint.id}
+                endpoint={endpoint}
+                timeScale={timeScale}
+                accessToken={accessToken}
+                agentDirectory={resolvedDirectory}
+                onTimeScaleChange={onTimeScaleChange}
+                onRun={onRun}
+              />
+            ))}
+          </div>
         </div>
       </div>
     </div>

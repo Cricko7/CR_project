@@ -76,6 +76,27 @@ export const API_ENDPOINTS: EndpointDefinition[] = [
     })
   },
   {
+    id: 'agent-create',
+    title: 'Create Agent',
+    category: 'agents',
+    kind: 'rest',
+    method: 'POST',
+    path: '/agents',
+    summary: 'Create a new AI agent instance with optional avatar/personality.',
+    defaultBody: toJson({
+      name: 'New Agent',
+      avatar_url: null,
+      personality_json: {}
+    }),
+    sampleResponse: toJson({
+      id: 'uuid-agent-z',
+      name: 'New Agent',
+      avatar_url: null,
+      personality_json: {},
+      created_at: '2026-02-17T12:00:00Z'
+    })
+  },
+  {
     id: 'agent-inspector',
     title: 'Inspector Profile',
     category: 'agents',

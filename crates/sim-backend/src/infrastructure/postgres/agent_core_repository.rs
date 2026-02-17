@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::agent_core::{
     AgentCoreRepository, AgentEventRecord, AgentRecord, AgentStateRecord,
-    DEFAULT_SIMULATION_TIME_SCALE, InterventionRecord, MessageRecord, NewAgentEvent,
+    DEFAULT_SIMULATION_TIME_SCALE, InterventionRecord, MessageRecord, NewAgent, NewAgentEvent,
     NewIntervention, NewMessage, RelationshipRecord, SimulationTimeScaleRecord,
     TickLeaseAcquireResult,
 };
@@ -85,6 +85,48 @@ impl PostgresAgentCoreRepository {
 
 #[async_trait]
 impl AgentCoreRepository for PostgresAgentCoreRepository {
+    async fn create_agent(&self, new_agent: &NewAgent) -> Result<AgentRecord> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to open transaction for agent creation")?;
+        let agent_id = Uuid::new_v4();
+
+        let row = sqlx::query(
+            r#"
+            INSERT INTO agents (id, name, avatar_url, personality_json)
+            VALUES ($1, $2, $3, $4)
+            RETURNING id, name, avatar_url, personality_json, created_at
+            "#,
+        )
+        .bind(agent_id)
+        .bind(&new_agent.name)
+        .bind(&new_agent.avatar_url)
+        .bind(&new_agent.personality_json)
+        .fetch_one(&mut *tx)
+        .await
+        .context("failed to create agent")?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO agent_states (agent_id, valence, arousal, mood_label, updated_at)
+            VALUES ($1, 0.0, 0.0, 'neutral', NOW())
+            ON CONFLICT (agent_id) DO NOTHING
+            "#,
+        )
+        .bind(agent_id)
+        .execute(&mut *tx)
+        .await
+        .context("failed to initialize agent state")?;
+
+        tx.commit()
+            .await
+            .context("failed to commit agent creation transaction")?;
+
+        Ok(map_agent_record(row))
+    }
+
     async fn get_agent(&self, agent_id: Uuid) -> Result<Option<AgentRecord>> {
         let row = sqlx::query(
             r#"

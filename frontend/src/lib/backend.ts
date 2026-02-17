@@ -205,7 +205,7 @@ export const readSingleWebSocketEvent = ({
         const parsed = JSON.parse(raw) as unknown;
         finish(() => resolve(parsed));
       } catch {
-        finish(() => reject(new BackendError('parse_error', 'Invalid WebSocket payload')));
+        finish(() => resolve(raw));
       }
     };
 

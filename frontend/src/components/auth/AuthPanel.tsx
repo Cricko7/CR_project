@@ -111,21 +111,16 @@ export const AuthPanel = () => {
           {mode === 'register' ? (
             <div className="space-y-1">
               <Label>Name</Label>
-              <Input value={name} onChange={(event) => setName(event.target.value)} placeholder="Alex Mercer" />
+              <Input value={name} onChange={(event) => setName(event.target.value)} />
             </div>
           ) : null}
           <div className="space-y-1">
             <Label>Email</Label>
-            <Input value={email} onChange={(event) => setEmail(event.target.value)} placeholder="agent@cyber.life" />
+            <Input value={email} onChange={(event) => setEmail(event.target.value)} />
           </div>
           <div className="space-y-1">
             <Label>Password</Label>
-            <Input
-              type="password"
-              value={password}
-              onChange={(event) => setPassword(event.target.value)}
-              placeholder="••••••••"
-            />
+            <Input type="password" value={password} onChange={(event) => setPassword(event.target.value)} />
           </div>
         </div>
 

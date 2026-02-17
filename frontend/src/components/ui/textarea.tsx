@@ -4,7 +4,7 @@ import { cn } from '../../lib/cn';
 export const Textarea = React.forwardRef<
   HTMLTextAreaElement,
   React.TextareaHTMLAttributes<HTMLTextAreaElement>
->(({ className, ...props }, ref) => (
+>(({ className, placeholder: _placeholder, ...props }, ref) => (
   <textarea
     ref={ref}
     className={cn(
