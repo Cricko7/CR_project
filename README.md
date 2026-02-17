@@ -1094,6 +1094,11 @@ Payload в point:
 docker compose up --build -d
 ```
 
+Опционально для LLM fallback через OpenRouter перед запуском:
+```bash
+set OPENROUTER_API_KEY=<your_openrouter_api_key>
+```
+
 Что поднимется:
 - `postgres` (DB)
 - `qdrant` (vector DB)
