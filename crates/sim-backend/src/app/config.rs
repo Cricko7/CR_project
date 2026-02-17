@@ -12,6 +12,10 @@ const DEFAULT_HOST: &str = "0.0.0.0";
 const DEFAULT_API_PORT: u16 = 8080;
 const DEFAULT_API_EVENT_BRIDGE_INTERVAL_MS: u64 = 500;
 const DEFAULT_API_EVENT_BRIDGE_BATCH_SIZE: u32 = 128;
+const DEFAULT_API_RATE_LIMIT_REQUESTS_PER_MINUTE: u32 = 240;
+const DEFAULT_AUTH_JWT_SECRET: &str = "change-me-dev-jwt-secret";
+const DEFAULT_AUTH_ACCESS_TOKEN_TTL_SECONDS: u64 = 900;
+const DEFAULT_AUTH_REFRESH_TOKEN_TTL_SECONDS: u64 = 604_800;
 const DEFAULT_SHUTDOWN_TIMEOUT_MS: u64 = 15_000;
 const DEFAULT_WORKER_TICK_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_WORKER_TICK_CONCURRENCY: u32 = 8;
@@ -105,6 +109,10 @@ pub struct ApiConfig {
     pub port: u16,
     pub event_bridge_interval: Duration,
     pub event_bridge_batch_size: u32,
+    pub rate_limit_requests_per_minute: u32,
+    pub auth_jwt_secret: String,
+    pub auth_access_token_ttl: Duration,
+    pub auth_refresh_token_ttl: Duration,
 }
 
 impl ApiConfig {
@@ -127,6 +135,20 @@ impl ApiConfig {
             "API_EVENT_BRIDGE_BATCH_SIZE",
             DEFAULT_API_EVENT_BRIDGE_BATCH_SIZE,
         )?;
+        let rate_limit_requests_per_minute: u32 = parse_env(
+            "API_RATE_LIMIT_REQUESTS_PER_MINUTE",
+            DEFAULT_API_RATE_LIMIT_REQUESTS_PER_MINUTE,
+        )?;
+        let auth_jwt_secret: String =
+            parse_env("AUTH_JWT_SECRET", DEFAULT_AUTH_JWT_SECRET.to_owned())?;
+        let auth_access_token_ttl_seconds: u64 = parse_env(
+            "AUTH_ACCESS_TOKEN_TTL_SECONDS",
+            DEFAULT_AUTH_ACCESS_TOKEN_TTL_SECONDS,
+        )?;
+        let auth_refresh_token_ttl_seconds: u64 = parse_env(
+            "AUTH_REFRESH_TOKEN_TTL_SECONDS",
+            DEFAULT_AUTH_REFRESH_TOKEN_TTL_SECONDS,
+        )?;
         if port == 0 {
             return Err(ConfigError::invalid("API_PORT", "must be greater than 0"));
         }
@@ -142,6 +164,27 @@ impl ApiConfig {
                 "must be greater than 0",
             ));
         }
+        if rate_limit_requests_per_minute == 0 {
+            return Err(ConfigError::invalid(
+                "API_RATE_LIMIT_REQUESTS_PER_MINUTE",
+                "must be greater than 0",
+            ));
+        }
+        if auth_jwt_secret.trim().is_empty() {
+            return Err(ConfigError::invalid("AUTH_JWT_SECRET", "must not be empty"));
+        }
+        if auth_access_token_ttl_seconds == 0 {
+            return Err(ConfigError::invalid(
+                "AUTH_ACCESS_TOKEN_TTL_SECONDS",
+                "must be greater than 0",
+            ));
+        }
+        if auth_refresh_token_ttl_seconds == 0 {
+            return Err(ConfigError::invalid(
+                "AUTH_REFRESH_TOKEN_TTL_SECONDS",
+                "must be greater than 0",
+            ));
+        }
 
         Ok(Self {
             common,
@@ -153,6 +196,10 @@ impl ApiConfig {
             port,
             event_bridge_interval: Duration::from_millis(event_bridge_interval_ms),
             event_bridge_batch_size,
+            rate_limit_requests_per_minute,
+            auth_jwt_secret,
+            auth_access_token_ttl: Duration::from_secs(auth_access_token_ttl_seconds),
+            auth_refresh_token_ttl: Duration::from_secs(auth_refresh_token_ttl_seconds),
         })
     }
 

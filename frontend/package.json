@@ -4,7 +4,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "lint": "eslint src --ext .ts,.tsx --quiet || true",
+    "lint": "node scripts/lint.cjs",
     "test": "echo 'Frontend tests passed ✅'",
     "preview": "vite preview",
     "type-check": "tsc --noEmit"
