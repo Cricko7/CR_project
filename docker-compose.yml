@@ -49,11 +49,11 @@ services:
       API_EVENT_BRIDGE_INTERVAL_MS: "500"
       API_EVENT_BRIDGE_BATCH_SIZE: "128"
       GEMINI_MIN_REQUEST_INTERVAL_MS: "1000"
-      # GEMINI_API_KEY: "<optional>"
-      # GEMINI_MODEL: "gemini-2.0-flash"
-      # OPENROUTER_API_KEY: "<optional fallback>"
-      # OPENROUTER_MODEL: "openai/gpt-oss-120b:free"
-      # OPENROUTER_REASONING_ENABLED: "false"
+      GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
+      GEMINI_MODEL: "${GEMINI_MODEL:-gemini-2.0-flash}"
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
+      OPENROUTER_MODEL: "${OPENROUTER_MODEL:-openai/gpt-oss-120b:free}"
+      OPENROUTER_REASONING_ENABLED: "${OPENROUTER_REASONING_ENABLED:-false}"
     ports:
       - "8080:8080"
     depends_on:
@@ -105,11 +105,11 @@ services:
       MEMORY_EMBED_INTERVAL_MS: "5000"
       MEMORY_SUMMARY_INTERVAL_MS: "30000"
       GEMINI_MIN_REQUEST_INTERVAL_MS: "1000"
-      # GEMINI_API_KEY: "<optional>"
-      # GEMINI_MODEL: "gemini-2.0-flash"
-      # OPENROUTER_API_KEY: "<optional fallback>"
-      # OPENROUTER_MODEL: "openai/gpt-oss-120b:free"
-      # OPENROUTER_REASONING_ENABLED: "false"
+      GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
+      GEMINI_MODEL: "${GEMINI_MODEL:-gemini-2.0-flash}"
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
+      OPENROUTER_MODEL: "${OPENROUTER_MODEL:-openai/gpt-oss-120b:free}"
+      OPENROUTER_REASONING_ENABLED: "${OPENROUTER_REASONING_ENABLED:-false}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -129,7 +129,7 @@ services:
     ports:
       - "3000:3000"
     environment:
-      VITE_API_URL: "http://localhost:8080"
+      VITE_API_BASE_URL: "http://localhost:8080"
     depends_on:
       - api
     restart: unless-stopped

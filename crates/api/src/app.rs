@@ -10,8 +10,8 @@ use axum::extract::{
     ConnectInfo, Path, Query, State,
     ws::{Message, WebSocket, WebSocketUpgrade},
 };
-use axum::http::header::AUTHORIZATION;
-use axum::http::{Request, StatusCode, Uri};
+use axum::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
+use axum::http::{Method, Request, StatusCode, Uri};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -44,6 +44,7 @@ use sim_backend::memory::{
 };
 use sqlx::Row;
 use tokio::sync::{Mutex, broadcast};
+use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
 
 mod auth;
@@ -169,6 +170,10 @@ pub async fn run() -> anyhow::Result<()> {
         auth: auth_state,
         rate_limit: rate_limit_state,
     };
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([AUTHORIZATION, CONTENT_TYPE, ACCEPT]);
     let app = Router::new()
         .route("/health", get(health))
         .route("/livez", get(health))
@@ -216,6 +221,7 @@ pub async fn run() -> anyhow::Result<()> {
         .route("/ws/relationships", get(ws_relationships))
         .layer(from_fn_with_state(app_state.clone(), auth_middleware))
         .layer(from_fn_with_state(app_state.clone(), rate_limit_middleware))
+        .layer(cors)
         .with_state(app_state);
 
     let socket_addr = config.socket_addr();

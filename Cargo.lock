@@ -47,6 +47,7 @@ dependencies = [
  "sim-backend",
  "sqlx",
  "tokio",
+ "tower-http",
  "tracing",
  "uuid",
 ]
