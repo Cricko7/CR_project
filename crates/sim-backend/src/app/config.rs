@@ -12,6 +12,10 @@ const DEFAULT_HOST: &str = "0.0.0.0";
 const DEFAULT_API_PORT: u16 = 8080;
 const DEFAULT_API_EVENT_BRIDGE_INTERVAL_MS: u64 = 500;
 const DEFAULT_API_EVENT_BRIDGE_BATCH_SIZE: u32 = 128;
+const DEFAULT_API_RATE_LIMIT_REQUESTS_PER_MINUTE: u32 = 240;
+const DEFAULT_AUTH_JWT_SECRET: &str = "change-me-dev-jwt-secret";
+const DEFAULT_AUTH_ACCESS_TOKEN_TTL_SECONDS: u64 = 900;
+const DEFAULT_AUTH_REFRESH_TOKEN_TTL_SECONDS: u64 = 604_800;
 const DEFAULT_SHUTDOWN_TIMEOUT_MS: u64 = 15_000;
 const DEFAULT_WORKER_TICK_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_WORKER_TICK_CONCURRENCY: u32 = 8;
@@ -36,6 +40,12 @@ const DEFAULT_GEMINI_MAX_RETRIES: u32 = 2;
 const DEFAULT_GEMINI_RETRY_BACKOFF_MS: u64 = 300;
 const DEFAULT_GEMINI_MIN_REQUEST_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_GEMINI_EMBED_MODEL: &str = "text-embedding-004";
+const DEFAULT_OPENROUTER_MODEL: &str = "openai/gpt-oss-120b:free";
+const DEFAULT_OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
+const DEFAULT_OPENROUTER_TIMEOUT_MS: u64 = 15_000;
+const DEFAULT_OPENROUTER_MAX_RETRIES: u32 = 2;
+const DEFAULT_OPENROUTER_RETRY_BACKOFF_MS: u64 = 300;
+const DEFAULT_OPENROUTER_REASONING_ENABLED: bool = false;
 const DEFAULT_QDRANT_URL: &str = "http://localhost:6333";
 const DEFAULT_QDRANT_COLLECTION: &str = "agent_memories";
 const DEFAULT_QDRANT_TIMEOUT_MS: u64 = 5_000;
@@ -77,6 +87,17 @@ pub struct GeminiConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct OpenRouterConfig {
+    pub api_key: String,
+    pub model: String,
+    pub base_url: String,
+    pub timeout: Duration,
+    pub max_retries: u32,
+    pub retry_backoff: Duration,
+    pub reasoning_enabled: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct QdrantConfig {
     pub url: String,
     pub api_key: Option<String>,
@@ -101,10 +122,15 @@ pub struct ApiConfig {
     pub qdrant: QdrantConfig,
     pub memory: MemoryConfig,
     pub gemini: Option<GeminiConfig>,
+    pub openrouter: Option<OpenRouterConfig>,
     pub host: IpAddr,
     pub port: u16,
     pub event_bridge_interval: Duration,
     pub event_bridge_batch_size: u32,
+    pub rate_limit_requests_per_minute: u32,
+    pub auth_jwt_secret: String,
+    pub auth_access_token_ttl: Duration,
+    pub auth_refresh_token_ttl: Duration,
 }
 
 impl ApiConfig {
@@ -114,6 +140,7 @@ impl ApiConfig {
         let qdrant = load_qdrant_config()?;
         let memory = load_memory_config()?;
         let gemini = load_gemini_config()?;
+        let openrouter = load_openrouter_config()?;
         let host_raw: String = parse_env("API_HOST", DEFAULT_HOST.to_owned())?;
         let host = host_raw
             .parse::<IpAddr>()
@@ -126,6 +153,20 @@ impl ApiConfig {
         let event_bridge_batch_size: u32 = parse_env(
             "API_EVENT_BRIDGE_BATCH_SIZE",
             DEFAULT_API_EVENT_BRIDGE_BATCH_SIZE,
+        )?;
+        let rate_limit_requests_per_minute: u32 = parse_env(
+            "API_RATE_LIMIT_REQUESTS_PER_MINUTE",
+            DEFAULT_API_RATE_LIMIT_REQUESTS_PER_MINUTE,
+        )?;
+        let auth_jwt_secret: String =
+            parse_env("AUTH_JWT_SECRET", DEFAULT_AUTH_JWT_SECRET.to_owned())?;
+        let auth_access_token_ttl_seconds: u64 = parse_env(
+            "AUTH_ACCESS_TOKEN_TTL_SECONDS",
+            DEFAULT_AUTH_ACCESS_TOKEN_TTL_SECONDS,
+        )?;
+        let auth_refresh_token_ttl_seconds: u64 = parse_env(
+            "AUTH_REFRESH_TOKEN_TTL_SECONDS",
+            DEFAULT_AUTH_REFRESH_TOKEN_TTL_SECONDS,
         )?;
         if port == 0 {
             return Err(ConfigError::invalid("API_PORT", "must be greater than 0"));
@@ -142,6 +183,27 @@ impl ApiConfig {
                 "must be greater than 0",
             ));
         }
+        if rate_limit_requests_per_minute == 0 {
+            return Err(ConfigError::invalid(
+                "API_RATE_LIMIT_REQUESTS_PER_MINUTE",
+                "must be greater than 0",
+            ));
+        }
+        if auth_jwt_secret.trim().is_empty() {
+            return Err(ConfigError::invalid("AUTH_JWT_SECRET", "must not be empty"));
+        }
+        if auth_access_token_ttl_seconds == 0 {
+            return Err(ConfigError::invalid(
+                "AUTH_ACCESS_TOKEN_TTL_SECONDS",
+                "must be greater than 0",
+            ));
+        }
+        if auth_refresh_token_ttl_seconds == 0 {
+            return Err(ConfigError::invalid(
+                "AUTH_REFRESH_TOKEN_TTL_SECONDS",
+                "must be greater than 0",
+            ));
+        }
 
         Ok(Self {
             common,
@@ -149,10 +211,15 @@ impl ApiConfig {
             qdrant,
             memory,
             gemini,
+            openrouter,
             host,
             port,
             event_bridge_interval: Duration::from_millis(event_bridge_interval_ms),
             event_bridge_batch_size,
+            rate_limit_requests_per_minute,
+            auth_jwt_secret,
+            auth_access_token_ttl: Duration::from_secs(auth_access_token_ttl_seconds),
+            auth_refresh_token_ttl: Duration::from_secs(auth_refresh_token_ttl_seconds),
         })
     }
 
@@ -168,6 +235,7 @@ pub struct WorkerConfig {
     pub qdrant: QdrantConfig,
     pub memory: MemoryConfig,
     pub gemini: Option<GeminiConfig>,
+    pub openrouter: Option<OpenRouterConfig>,
     pub agent_ids: Vec<Uuid>,
     pub tick_interval: Duration,
     pub tick_concurrency: u32,
@@ -188,6 +256,7 @@ impl WorkerConfig {
         let qdrant = load_qdrant_config()?;
         let memory = load_memory_config()?;
         let gemini = load_gemini_config()?;
+        let openrouter = load_openrouter_config()?;
         let agent_ids = parse_uuid_list_env("WORKER_AGENT_IDS")?;
         let tick_interval_ms: u64 =
             parse_env("WORKER_TICK_INTERVAL_MS", DEFAULT_WORKER_TICK_INTERVAL_MS)?;
@@ -296,6 +365,7 @@ impl WorkerConfig {
             qdrant,
             memory,
             gemini,
+            openrouter,
             agent_ids,
             tick_interval: Duration::from_millis(tick_interval_ms),
             tick_concurrency,
@@ -473,6 +543,66 @@ fn load_gemini_config() -> Result<Option<GeminiConfig>, ConfigError> {
         max_retries,
         retry_backoff: Duration::from_millis(retry_backoff_ms),
         min_request_interval: Duration::from_millis(min_request_interval_ms),
+    }))
+}
+
+fn load_openrouter_config() -> Result<Option<OpenRouterConfig>, ConfigError> {
+    let api_key = env::var("OPENROUTER_API_KEY")
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_default();
+    if api_key.is_empty() {
+        return Ok(None);
+    }
+
+    let model: String = parse_env("OPENROUTER_MODEL", DEFAULT_OPENROUTER_MODEL.to_owned())?;
+    let base_url: String = parse_env(
+        "OPENROUTER_BASE_URL",
+        DEFAULT_OPENROUTER_BASE_URL.to_owned(),
+    )?;
+    let timeout_ms: u64 = parse_env("OPENROUTER_TIMEOUT_MS", DEFAULT_OPENROUTER_TIMEOUT_MS)?;
+    let max_retries: u32 = parse_env("OPENROUTER_MAX_RETRIES", DEFAULT_OPENROUTER_MAX_RETRIES)?;
+    let retry_backoff_ms: u64 = parse_env(
+        "OPENROUTER_RETRY_BACKOFF_MS",
+        DEFAULT_OPENROUTER_RETRY_BACKOFF_MS,
+    )?;
+    let reasoning_enabled: bool = parse_env(
+        "OPENROUTER_REASONING_ENABLED",
+        DEFAULT_OPENROUTER_REASONING_ENABLED,
+    )?;
+
+    if model.trim().is_empty() {
+        return Err(ConfigError::invalid(
+            "OPENROUTER_MODEL",
+            "must not be empty",
+        ));
+    }
+    if base_url.trim().is_empty() {
+        return Err(ConfigError::invalid(
+            "OPENROUTER_BASE_URL",
+            "must not be empty",
+        ));
+    }
+    if timeout_ms == 0 {
+        return Err(ConfigError::invalid(
+            "OPENROUTER_TIMEOUT_MS",
+            "must be greater than 0",
+        ));
+    }
+    if retry_backoff_ms == 0 {
+        return Err(ConfigError::invalid(
+            "OPENROUTER_RETRY_BACKOFF_MS",
+            "must be greater than 0",
+        ));
+    }
+
+    Ok(Some(OpenRouterConfig {
+        api_key,
+        model,
+        base_url,
+        timeout: Duration::from_millis(timeout_ms),
+        max_retries,
+        retry_backoff: Duration::from_millis(retry_backoff_ms),
+        reasoning_enabled,
     }))
 }
 

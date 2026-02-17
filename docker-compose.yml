@@ -51,6 +51,9 @@ services:
       GEMINI_MIN_REQUEST_INTERVAL_MS: "1000"
       # GEMINI_API_KEY: "<optional>"
       # GEMINI_MODEL: "gemini-2.0-flash"
+      # OPENROUTER_API_KEY: "<optional fallback>"
+      # OPENROUTER_MODEL: "openai/gpt-oss-120b:free"
+      # OPENROUTER_REASONING_ENABLED: "false"
     ports:
       - "8080:8080"
     depends_on:
@@ -104,6 +107,9 @@ services:
       GEMINI_MIN_REQUEST_INTERVAL_MS: "1000"
       # GEMINI_API_KEY: "<optional>"
       # GEMINI_MODEL: "gemini-2.0-flash"
+      # OPENROUTER_API_KEY: "<optional fallback>"
+      # OPENROUTER_MODEL: "openai/gpt-oss-120b:free"
+      # OPENROUTER_REASONING_ENABLED: "false"
     depends_on:
       postgres:
         condition: service_healthy

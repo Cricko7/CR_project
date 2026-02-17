@@ -1,5 +1,9 @@
+mod fallback;
+
 use anyhow::Result;
 use async_trait::async_trait;
+
+pub use fallback::FallbackLlm;
 
 #[derive(Debug, Clone)]
 pub struct LlmGenerateRequest {

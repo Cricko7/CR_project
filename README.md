@@ -1,6 +1,6 @@
 # Multi-Agent Simulation Backend (Rust)
 
-Документ актуален на: **2026-02-16**  
+Документ актуален на: **2026-02-17**  
 Этот README полностью отражает текущее состояние кода в репозитории `CR_project`.
 
 ## 1. Что это за проект
@@ -9,7 +9,7 @@ Backend для симуляции мира автономных AI-агенто�
 - у агентов есть личность, состояние настроения, память;
 - агенты выполняют "тики жизни" и порождают события;
 - память хранится в PostgreSQL + векторно индексируется в Qdrant;
-- для генерации действий/суммаризации используется **Google Gemini API** (с fallback-режимом без LLM);
+- для генерации действий/суммаризации используется **Google Gemini API** с автоматическим runtime fallback на **OpenRouter**;
 - есть HTTP API + WebSocket-стрим событий.
 
 Проект сейчас сфокусирован на backend-ядре. Полноценный web-frontend в этом репозитории **не реализован**.
@@ -28,6 +28,7 @@ Backend для симуляции мира автономных AI-агенто�
 | 6. Граф отношений | `FULLY IMPLEMENTED` | Есть graph snapshot API (`/relationships/graph`) и live stream (`/ws/relationships`); worker публикует `agent.relationship.updated` события |
 | 7. Inspector агента | `FULLY IMPLEMENTED` | Есть агрегирующий endpoint `/agents/{id}/inspector` (agent profile + state + recent events/messages/relationships/memories + optional recall) |
 | 8. Панель вмешательства | `FULLY IMPLEMENTED` | Реализованы `POST/GET /interventions` (включая `append_event`, `send_message`, `set_time_scale`) и прямой runtime-control скорости через `GET/POST /simulation/time-scale` |
+| 9. Security baseline (JWT + anti-DDoS) | `FULLY IMPLEMENTED` | Добавлены `POST /auth/register|login|refresh`, JWT middleware для всех защищенных REST/WS endpoint'ов и глобальный rate limit по IP (requests/min из env) |
 | Доп. фича 1: настроение влияет на стиль речи | `FULLY IMPLEMENTED` | Введены формализованные mood-based speech style policies (tone/cadence/diction/punctuation), они инжектятся в LLM prompts, применяются в deterministic fallback и сохраняются в `events.payload_json.speech_style` |
 | Доп. фича 2: страница агента с историей отношений | `FULLY IMPLEMENTED` | Добавлен агрегированный relationship timeline API (`/agents/{id}/relationships/history`) и расширен inspector (`relationship_timeline`), что закрывает backend-контракт для страницы истории отношений |
 
@@ -42,11 +43,13 @@ flowchart LR
     Admin[Admin/User UI] -->|HTTP + WebSocket| API[API Service - Axum]
     API -->|SQL| PG[(PostgreSQL)]
     API -->|Vector Search/Upsert| QD[(Qdrant)]
-    API -->|LLM + Embeddings| GEM[Google Gemini API]
+    API -->|Primary LLM + Embeddings| GEM[Google Gemini API]
+    API -->|LLM fallback| OR[OpenRouter]
 
     Worker[Background Worker] -->|SQL| PG
     Worker -->|Vector Upsert/Search| QD
-    Worker -->|LLM + Embeddings| GEM
+    Worker -->|Primary LLM + Embeddings| GEM
+    Worker -->|LLM fallback| OR
 ```
 
 ### 3.2 Контейнеры (C4 Level 2)
@@ -64,6 +67,7 @@ flowchart TB
     CoreLib --> PG[(PostgreSQL)]
     CoreLib --> QD[(Qdrant)]
     CoreLib --> GEM[Gemini API]
+    CoreLib --> OR[OpenRouter API]
 ```
 
 ### 3.3 Компоненты AgentCore (C4 Level 3)
@@ -155,7 +159,7 @@ flowchart LR
 | Runtime | Tokio |
 | DB | PostgreSQL (`sqlx`) |
 | Vector DB | Qdrant (HTTP API) |
-| LLM | Google Gemini API |
+| LLM | Google Gemini API (primary) + OpenRouter (auto fallback) |
 | Embeddings | Gemini embeddings (`text-embedding-004` по умолчанию) или локальный hash fallback |
 | Логи | tracing + tracing-subscriber (JSON) |
 | Graceful shutdown | custom `ServiceRuntime` + cancellation token |
@@ -194,7 +198,7 @@ CR_project/
 │           ├── app/                # config, runtime, observability
 │           ├── agent_core/         # orchestrator, persistence traits, tick runner
 │           ├── memory/             # memory service + ports
-│           ├── infrastructure/     # postgres, qdrant, gemini adapters
+│           ├── infrastructure/     # postgres, qdrant, gemini, openrouter adapters
 │           ├── llm/                # LLM port
 │           └── lib.rs
 |
@@ -315,6 +319,18 @@ CR_project/
 
 Базовый URL по умолчанию: `http://127.0.0.1:8080`
 
+Защита API:
+- `GET /health` и `GET /livez` доступны без токена;
+- `POST /auth/register`, `POST /auth/login`, `POST /auth/refresh` доступны без access token;
+- все остальные REST endpoint'ы и WS handshake (`/ws/events`, `/ws/relationships`) требуют JWT access token:
+  - `Authorization: Bearer <access_token>` для REST;
+  - `?access_token=<access_token>` query для browser WebSocket.
+
+Глобальный анти-DDoS:
+- включен rate limit per IP на уровне API gateway middleware;
+- лимит задается env-переменной `API_RATE_LIMIT_REQUESTS_PER_MINUTE`;
+- при превышении возвращается `429 rate_limit_exceeded`.
+
 ### 8.1 Health
 
 #### `GET /health`
@@ -327,6 +343,65 @@ Response:
   "service": "sim-backend"
 }
 ```
+
+### 8.1.1 Auth register
+
+#### `POST /auth/register`
+
+Request:
+```json
+{
+  "name": "Control Operator",
+  "email": "operator@cyber.life",
+  "password": "strong-password-123"
+}
+```
+
+Response (`201`):
+```json
+{
+  "user": {
+    "id": "uuid",
+    "email": "operator@cyber.life",
+    "name": "Control Operator",
+    "created_at": "2026-02-17T12:00:00Z"
+  },
+  "tokens": {
+    "access_token": "jwt",
+    "refresh_token": "jwt",
+    "access_expires_at": "2026-02-17T12:15:00Z",
+    "refresh_expires_at": "2026-02-24T12:00:00Z",
+    "token_type": "Bearer"
+  }
+}
+```
+
+### 8.1.2 Auth login
+
+#### `POST /auth/login`
+
+Request:
+```json
+{
+  "email": "operator@cyber.life",
+  "password": "strong-password-123"
+}
+```
+
+Response (`200`): same envelope as `/auth/register`.
+
+### 8.1.3 Auth refresh
+
+#### `POST /auth/refresh`
+
+Request:
+```json
+{
+  "refresh_token": "jwt"
+}
+```
+
+Response (`200`): same envelope as `/auth/register` (новая пара access/refresh токенов).
 
 ### 8.2 Agent Tick
 
@@ -866,6 +941,7 @@ Examples:
 - `crates/sim-backend/migrations/0004_memory_embedding_retry_dlq.sql`
 - `crates/sim-backend/migrations/0005_multyagent_communication.sql`
 - `crates/sim-backend/migrations/0006_simulation_time_scale.sql`
+- `crates/sim-backend/migrations/0007_auth_users.sql`
 
 Основные таблицы:
 - `agents`: карточка агента, personality JSON.
@@ -876,6 +952,7 @@ Examples:
 - `messages`: очередь межагентных сообщений + delivery status machine.
 - `interventions`: журнал админ-вмешательств (action payload + `result_status`).
 - `simulation_controls`: singleton runtime-настройка `time_scale` для скорости симуляции.
+- `auth_users`: учетные записи операторов (`email`, `password_hash`) для JWT auth flow.
 - `outbox_events`: каркас event publication.
 
 Колонки long-term memory:
@@ -920,6 +997,10 @@ Payload в point:
 | `API_PORT` | `8080` |
 | `API_EVENT_BRIDGE_INTERVAL_MS` | `500` |
 | `API_EVENT_BRIDGE_BATCH_SIZE` | `128` |
+| `API_RATE_LIMIT_REQUESTS_PER_MINUTE` | `240` |
+| `AUTH_JWT_SECRET` | `change-me-dev-jwt-secret` |
+| `AUTH_ACCESS_TOKEN_TTL_SECONDS` | `900` |
+| `AUTH_REFRESH_TOKEN_TTL_SECONDS` | `604800` |
 
 ### 10.3 Database
 
@@ -937,7 +1018,7 @@ Payload в point:
 
 | Variable | Default |
 |---|---|
-| `GEMINI_API_KEY` | empty -> LLM disabled |
+| `GEMINI_API_KEY` | empty -> Gemini disabled |
 | `GEMINI_MODEL` | `gemini-2.0-flash` |
 | `GEMINI_EMBED_MODEL` | `text-embedding-004` |
 | `GEMINI_BASE_URL` | `https://generativelanguage.googleapis.com` |
@@ -946,7 +1027,24 @@ Payload в point:
 | `GEMINI_RETRY_BACKOFF_MS` | `300` |
 | `GEMINI_MIN_REQUEST_INTERVAL_MS` | `1000` |
 
-### 10.5 Qdrant
+### 10.5 OpenRouter (LLM fallback)
+
+| Variable | Default |
+|---|---|
+| `OPENROUTER_API_KEY` | empty -> OpenRouter disabled |
+| `OPENROUTER_MODEL` | `openai/gpt-oss-120b:free` |
+| `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` |
+| `OPENROUTER_TIMEOUT_MS` | `15000` |
+| `OPENROUTER_MAX_RETRIES` | `2` |
+| `OPENROUTER_RETRY_BACKOFF_MS` | `300` |
+| `OPENROUTER_REASONING_ENABLED` | `false` |
+
+Поведение:
+- если настроены и Gemini, и OpenRouter: Gemini используется как primary, при ошибке запроса (429/5xx/transport) автоматически вызывается OpenRouter;
+- если Gemini недоступен на конкретном запросе, fallback выполняется в том же тике с тем же prompt-контекстом (включая уже извлеченные данные памяти/recall);
+- если задан только `OPENROUTER_API_KEY`, OpenRouter используется как основной LLM.
+
+### 10.6 Qdrant
 
 | Variable | Default |
 |---|---|
@@ -956,7 +1054,7 @@ Payload в point:
 | `QDRANT_VECTOR_SIZE` | `768` |
 | `QDRANT_TIMEOUT_MS` | `5000` |
 
-### 10.6 Memory workers
+### 10.7 Memory workers
 
 | Variable | Default |
 |---|---|
@@ -966,7 +1064,7 @@ Payload в point:
 | `MEMORY_EMBED_INTERVAL_MS` | `5000` |
 | `MEMORY_SUMMARY_INTERVAL_MS` | `30000` |
 
-### 10.7 Worker
+### 10.8 Worker
 
 | Variable | Default |
 |---|---|
@@ -996,6 +1094,11 @@ Payload в point:
 docker compose up --build -d
 ```
 
+Опционально для LLM fallback через OpenRouter перед запуском:
+```bash
+set OPENROUTER_API_KEY=<your_openrouter_api_key>
+```
+
 Что поднимется:
 - `postgres` (DB)
 - `qdrant` (vector DB)
@@ -1022,7 +1125,7 @@ docker compose down -v
 ### 11.1 Prerequisites
 - Rust stable toolchain;
 - Docker (для Postgres + Qdrant);
-- доступ к Google Gemini API key (опционально, но нужен для LLM режима).
+- доступ к Google Gemini API key и/или OpenRouter API key (опционально, но нужен для LLM режима).
 
 ### 11.2 Поднять инфраструктуру
 
@@ -1052,9 +1155,16 @@ set WORKER_MESSAGE_INTERVAL_MS=1000
 set WORKER_MESSAGE_BATCH_SIZE=32
 set GEMINI_API_KEY=<your_google_api_key>
 set GEMINI_MIN_REQUEST_INTERVAL_MS=1000
+set OPENROUTER_API_KEY=<your_openrouter_api_key>
 ```
 
-Если `GEMINI_API_KEY` не задан, система работает в fallback-режиме:
+Если заданы `GEMINI_API_KEY` и `OPENROUTER_API_KEY`:
+- Gemini работает как primary LLM;
+- при недоступности Gemini запрос автоматически уходит в OpenRouter.
+
+Если задан только `OPENROUTER_API_KEY`, OpenRouter используется как основной LLM.
+
+Если не заданы оба ключа (`GEMINI_API_KEY` и `OPENROUTER_API_KEY`), система работает в fallback-режиме:
 - tick summaries deterministic;
 - embeddings через local hash embedder.
 
@@ -1113,16 +1223,16 @@ VALUES
 - Есть таймауты и retry для Gemini HTTP.
 
 ### Ключевые дыры/риски
-1. **Нет аутентификации/авторизации** API и WS.
-2. **Нет rate limiting** на дорогие endpoint'ы (`/ticks`, `/messages/*`, `/memories/*`, `/process-embeddings`).
+1. **JWT revocation не реализован** (нет blacklist/rotation storage, refresh токен валиден до `exp`).
+2. **Rate limit in-memory и per-instance**: при горизонтальном масштабировании нужен shared limiter (Redis/Envoy/Nginx).
 3. **Нет tenant isolation** (single-world assumptions).
 4. **WS feed без durable delivery**: нет клиентских ack/offset storage, при disconnect нужен reconnect + catch-up.
 5. **Нет секрет-менеджмента** (Vault/KMS), только env vars.
-6. **Нет audit trail** действий админа на уровне API policy.
+6. **Нет fine-grained RBAC**: токен валидирует identity, но не роль/scopes на endpoint-level.
 
 ### Минимум, который стоит сделать перед демо
-1. Добавить простой JWT/API key guard на admin endpoints.
-2. Добавить глобальный rate limit (IP + endpoint bucket).
+1. Перенести rate limit в shared store (Redis) или на edge proxy (Nginx/Traefik/Cloud LB).
+2. Добавить refresh token revocation (DB/jti blacklist + logout/invalidate).
 3. Ограничить CORS и WS origins.
 
 ---
@@ -1173,8 +1283,9 @@ VALUES
    - vector recall;
    - overflow summarization.
 7. Qdrant adapter и Gemini adapters.
-8. REST endpoints для state/events/memory/ticks/messages/relationships + relationship history timeline + relationship graph snapshot + agent inspector profile + interventions panel.
-9. WebSocket endpoints `/ws/events` и `/ws/relationships` с snapshot + live updates.
+8. REST endpoints для auth/state/events/memory/ticks/messages/relationships + relationship history timeline + relationship graph snapshot + agent inspector profile + interventions panel.
+9. WebSocket endpoints `/ws/events` и `/ws/relationships` с snapshot + live updates + JWT guard.
+10. Security middleware: JWT auth (`/auth/register|login|refresh`) + глобальный IP rate limiting (`429`).
 10. Worker циклы: ticks, mood-decay, message delivery, embedding, summarization.
 11. Миграции для базовой схемы, long-term memory, concurrency/failure hardening и мультиагентной коммуникации.
 12. Unit tests для `agent_core` и `memory`.

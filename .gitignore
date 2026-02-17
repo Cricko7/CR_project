@@ -1,2 +1,17 @@
 /target/
 **/*.rs.bk
+
+# Frontend artifacts and dependencies
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/.env
+frontend/.env.*
+!frontend/.env.example
+
+# Common local/dev files
+.DS_Store
+Thumbs.db
+*.log
+.idea/
+.vscode/
