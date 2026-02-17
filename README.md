@@ -1041,11 +1041,22 @@ Payload в point:
 | `OPENROUTER_MIN_REQUEST_INTERVAL_MS` | `15000` |
 
 Поведение:
-- если настроены и Gemini, и OpenRouter: Gemini используется как primary, при ошибке запроса (429/5xx/transport) автоматически вызывается OpenRouter;
+- если настроены `GEMINI_API_KEY`, `OPENROUTER_API_KEY` и `OLLAMA_MODEL`, цепочка такая: Gemini -> OpenRouter -> Ollama;
 - если Gemini недоступен на конкретном запросе, fallback выполняется в том же тике с тем же prompt-контекстом (включая уже извлеченные данные памяти/recall);
-- если задан только `OPENROUTER_API_KEY`, OpenRouter используется как основной LLM.
+- если задан только `OPENROUTER_API_KEY`, OpenRouter используется как основной LLM;
+- если задан только `OLLAMA_MODEL`, Ollama используется как основной LLM.
 
-### 10.6 Qdrant
+### 10.6 Ollama (local fallback)
+
+| Variable | Default |
+|---|---|
+| `OLLAMA_MODEL` | empty -> Ollama disabled |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` |
+| `OLLAMA_TIMEOUT_MS` | `60000` |
+| `OLLAMA_MAX_RETRIES` | `1` |
+| `OLLAMA_RETRY_BACKOFF_MS` | `500` |
+
+### 10.7 Qdrant
 
 | Variable | Default |
 |---|---|
@@ -1055,7 +1066,7 @@ Payload в point:
 | `QDRANT_VECTOR_SIZE` | `768` |
 | `QDRANT_TIMEOUT_MS` | `5000` |
 
-### 10.7 Memory workers
+### 10.8 Memory workers
 
 | Variable | Default |
 |---|---|
@@ -1065,7 +1076,7 @@ Payload в point:
 | `MEMORY_EMBED_INTERVAL_MS` | `5000` |
 | `MEMORY_SUMMARY_INTERVAL_MS` | `30000` |
 
-### 10.8 Worker
+### 10.9 Worker
 
 | Variable | Default |
 |---|---|
@@ -1169,15 +1180,25 @@ set GEMINI_API_KEY=<your_google_api_key>
 set GEMINI_MIN_REQUEST_INTERVAL_MS=1000
 set OPENROUTER_API_KEY=<your_openrouter_api_key>
 set OPENROUTER_MIN_REQUEST_INTERVAL_MS=15000
+set OLLAMA_MODEL=llama3.1:8b-instruct-q4_K_M
+set OLLAMA_BASE_URL=http://localhost:11434
+set OLLAMA_TIMEOUT_MS=60000
 ```
 
-Если заданы `GEMINI_API_KEY` и `OPENROUTER_API_KEY`:
+Если заданы `GEMINI_API_KEY`, `OPENROUTER_API_KEY` и `OLLAMA_MODEL`:
 - Gemini работает как primary LLM;
-- при недоступности Gemini запрос автоматически уходит в OpenRouter.
+- при недоступности Gemini запрос автоматически уходит в OpenRouter;
+- если OpenRouter тоже не отвечает, запрос уходит в Ollama.
+
+Если заданы `OPENROUTER_API_KEY` и `OLLAMA_MODEL`, но `GEMINI_API_KEY` не задан:
+- OpenRouter используется как primary LLM;
+- при ошибке OpenRouter используется Ollama.
 
 Если задан только `OPENROUTER_API_KEY`, OpenRouter используется как основной LLM.
 
-Если не заданы оба ключа (`GEMINI_API_KEY` и `OPENROUTER_API_KEY`), система работает в fallback-режиме:
+Если задан только `OLLAMA_MODEL`, Ollama используется как основной LLM.
+
+Если не заданы `GEMINI_API_KEY`, `OPENROUTER_API_KEY` и `OLLAMA_MODEL`, система работает в fallback-режиме:
 - tick summaries deterministic;
 - embeddings через local hash embedder.
 
@@ -1187,6 +1208,9 @@ set OPENROUTER_MIN_REQUEST_INTERVAL_MS=15000
 `OPENROUTER_MIN_REQUEST_INTERVAL_MS` задает минимальный интервал между запросами к OpenRouter
 в рамках одного процесса (API или worker). Для модели `openai/gpt-oss-120b:free` значение
 принудительно не может быть ниже `15000` мс.
+
+`OLLAMA_MODEL` включает локальный Ollama-клиент. Если сервис запущен в Docker, для доступа
+к Ollama на хосте обычно нужен `OLLAMA_BASE_URL=http://host.docker.internal:11434`.
 
 ### 11.4 Запуск сервисов
 

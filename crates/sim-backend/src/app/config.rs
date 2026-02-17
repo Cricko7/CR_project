@@ -48,6 +48,10 @@ const DEFAULT_OPENROUTER_RETRY_BACKOFF_MS: u64 = 300;
 const DEFAULT_OPENROUTER_REASONING_ENABLED: bool = false;
 const DEFAULT_OPENROUTER_MIN_REQUEST_INTERVAL_MS: u64 = 15_000;
 const OPENROUTER_GPT_OSS_120B_MODEL: &str = "openai/gpt-oss-120b:free";
+const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434";
+const DEFAULT_OLLAMA_TIMEOUT_MS: u64 = 60_000;
+const DEFAULT_OLLAMA_MAX_RETRIES: u32 = 1;
+const DEFAULT_OLLAMA_RETRY_BACKOFF_MS: u64 = 500;
 const DEFAULT_QDRANT_URL: &str = "http://localhost:6333";
 const DEFAULT_QDRANT_COLLECTION: &str = "agent_memories";
 const DEFAULT_QDRANT_TIMEOUT_MS: u64 = 5_000;
@@ -101,6 +105,15 @@ pub struct OpenRouterConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct OllamaConfig {
+    pub model: String,
+    pub base_url: String,
+    pub timeout: Duration,
+    pub max_retries: u32,
+    pub retry_backoff: Duration,
+}
+
+#[derive(Debug, Clone)]
 pub struct QdrantConfig {
     pub url: String,
     pub api_key: Option<String>,
@@ -126,6 +139,7 @@ pub struct ApiConfig {
     pub memory: MemoryConfig,
     pub gemini: Option<GeminiConfig>,
     pub openrouter: Option<OpenRouterConfig>,
+    pub ollama: Option<OllamaConfig>,
     pub host: IpAddr,
     pub port: u16,
     pub event_bridge_interval: Duration,
@@ -144,6 +158,7 @@ impl ApiConfig {
         let memory = load_memory_config()?;
         let gemini = load_gemini_config()?;
         let openrouter = load_openrouter_config()?;
+        let ollama = load_ollama_config()?;
         let host_raw: String = parse_env("API_HOST", DEFAULT_HOST.to_owned())?;
         let host = host_raw
             .parse::<IpAddr>()
@@ -215,6 +230,7 @@ impl ApiConfig {
             memory,
             gemini,
             openrouter,
+            ollama,
             host,
             port,
             event_bridge_interval: Duration::from_millis(event_bridge_interval_ms),
@@ -239,6 +255,7 @@ pub struct WorkerConfig {
     pub memory: MemoryConfig,
     pub gemini: Option<GeminiConfig>,
     pub openrouter: Option<OpenRouterConfig>,
+    pub ollama: Option<OllamaConfig>,
     pub agent_ids: Vec<Uuid>,
     pub tick_interval: Duration,
     pub tick_concurrency: u32,
@@ -260,6 +277,7 @@ impl WorkerConfig {
         let memory = load_memory_config()?;
         let gemini = load_gemini_config()?;
         let openrouter = load_openrouter_config()?;
+        let ollama = load_ollama_config()?;
         let agent_ids = parse_uuid_list_env("WORKER_AGENT_IDS")?;
         let tick_interval_ms: u64 =
             parse_env("WORKER_TICK_INTERVAL_MS", DEFAULT_WORKER_TICK_INTERVAL_MS)?;
@@ -369,6 +387,7 @@ impl WorkerConfig {
             memory,
             gemini,
             openrouter,
+            ollama,
             agent_ids,
             tick_interval: Duration::from_millis(tick_interval_ms),
             tick_concurrency,
@@ -576,7 +595,9 @@ fn load_openrouter_config() -> Result<Option<OpenRouterConfig>, ConfigError> {
         "OPENROUTER_MIN_REQUEST_INTERVAL_MS",
         DEFAULT_OPENROUTER_MIN_REQUEST_INTERVAL_MS,
     )?;
-    let min_request_interval_ms = if model.trim().eq_ignore_ascii_case(OPENROUTER_GPT_OSS_120B_MODEL)
+    let min_request_interval_ms = if model
+        .trim()
+        .eq_ignore_ascii_case(OPENROUTER_GPT_OSS_120B_MODEL)
     {
         min_request_interval_ms.max(15_000)
     } else {
@@ -617,6 +638,43 @@ fn load_openrouter_config() -> Result<Option<OpenRouterConfig>, ConfigError> {
         retry_backoff: Duration::from_millis(retry_backoff_ms),
         reasoning_enabled,
         min_request_interval: Duration::from_millis(min_request_interval_ms),
+    }))
+}
+
+fn load_ollama_config() -> Result<Option<OllamaConfig>, ConfigError> {
+    let model: String = parse_env("OLLAMA_MODEL", String::new())?;
+    if model.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let base_url: String = parse_env("OLLAMA_BASE_URL", DEFAULT_OLLAMA_BASE_URL.to_owned())?;
+    let timeout_ms: u64 = parse_env("OLLAMA_TIMEOUT_MS", DEFAULT_OLLAMA_TIMEOUT_MS)?;
+    let max_retries: u32 = parse_env("OLLAMA_MAX_RETRIES", DEFAULT_OLLAMA_MAX_RETRIES)?;
+    let retry_backoff_ms: u64 =
+        parse_env("OLLAMA_RETRY_BACKOFF_MS", DEFAULT_OLLAMA_RETRY_BACKOFF_MS)?;
+
+    if base_url.trim().is_empty() {
+        return Err(ConfigError::invalid("OLLAMA_BASE_URL", "must not be empty"));
+    }
+    if timeout_ms == 0 {
+        return Err(ConfigError::invalid(
+            "OLLAMA_TIMEOUT_MS",
+            "must be greater than 0",
+        ));
+    }
+    if retry_backoff_ms == 0 {
+        return Err(ConfigError::invalid(
+            "OLLAMA_RETRY_BACKOFF_MS",
+            "must be greater than 0",
+        ));
+    }
+
+    Ok(Some(OllamaConfig {
+        model: model.trim().to_owned(),
+        base_url,
+        timeout: Duration::from_millis(timeout_ms),
+        max_retries,
+        retry_backoff: Duration::from_millis(retry_backoff_ms),
     }))
 }
 

@@ -62,4 +62,3 @@ pub fn shared_openrouter_rate_limiter(min_interval: Duration) -> Arc<OpenRouterR
 
     limiter
 }
-

@@ -16,5 +16,12 @@ set "OPENROUTER_MODEL=openai/gpt-oss-120b:free"
 set "OPENROUTER_REASONING_ENABLED=false"
 set "OPENROUTER_MIN_REQUEST_INTERVAL_MS=15000"
 
+rem Optional local Ollama fallback settings.
+set "OLLAMA_MODEL="
+set "OLLAMA_BASE_URL=http://host.docker.internal:11434"
+set "OLLAMA_TIMEOUT_MS=60000"
+set "OLLAMA_MAX_RETRIES=1"
+set "OLLAMA_RETRY_BACKOFF_MS=500"
+
 rem Optional override of worker bootstrap agents.
 set "WORKER_AGENT_IDS=11111111-1111-1111-1111-111111111111,22222222-2222-2222-2222-222222222222"
