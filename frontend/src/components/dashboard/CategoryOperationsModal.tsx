@@ -16,6 +16,7 @@ interface OperationCardProps {
   timeScale: number;
   onTimeScaleChange: (value: number) => void;
   accessToken?: string;
+  operatorUserId?: string;
   agentDirectory: AgentDirectoryEntry[];
   onRun: (message: string) => void;
 }
@@ -28,6 +29,7 @@ interface CategoryOperationsModalProps {
   timeScale: number;
   onClose: () => void;
   accessToken?: string;
+  operatorUserId?: string;
   agentDirectory?: AgentDirectoryEntry[];
   onTimeScaleChange: (value: number) => void;
   onRun: (message: string) => void;
@@ -38,6 +40,7 @@ interface AgentInputProps {
   onChange: (next: string) => void;
   className?: string;
   directory: AgentDirectoryEntry[];
+  hint?: string;
 }
 
 interface AgentDirectoryEntry {
@@ -47,21 +50,51 @@ interface AgentDirectoryEntry {
 
 interface ParsedBodyDefaults {
   values: Record<string, string>;
+  hiddenValues: Record<string, string>;
   template: Record<string, unknown>;
 }
 
+const SYSTEM_MANAGED_BODY_KEYS = new Set(['admin_user_id', 'user_id']);
+
+const resolveParamHint = (endpoint: EndpointDefinition, param: EndpointParam) => {
+  if (param.key === 'id' && endpoint.path.includes('/agents/{id}')) return 'UUID агента, для которого выполняется операция.';
+  if (param.key === 'agent_id') return 'Опциональный фильтр по UUID агента.';
+  if (param.key === 'limit') return 'Максимальное число элементов в ответе.';
+  if (param.key === 'snapshot_limit') return 'Сколько последних записей отдать в начальном snapshot.';
+  if (param.key === 'after_id') return 'Курсор для пагинации событий: вернуть записи с id > after_id.';
+  if (param.key === 'recall_query') return 'Текст запроса для семантического поиска по памяти агента.';
+  if (param.key === 'top_k' || param.key === 'recall_top_k') return 'Сколько самых релевантных результатов вернуть.';
+  if (param.key === 'time_scale') return 'Скорость симуляции: 1.0 - нормальная, >1 быстрее, <1 медленнее.';
+  return `Параметр запроса: ${param.label}.`;
+};
+
+const resolveBodyFieldHint = (key: string) => {
+  if (key === 'admin_user_id' || key === 'user_id') return 'Заполняется автоматически из вашей текущей сессии.';
+  if (key === 'sender_agent_id') return 'UUID агента-отправителя.';
+  if (key === 'receiver_agent_id') return 'UUID агента-получателя.';
+  if (key === 'content') return 'Текст сообщения/памяти/события.';
+  if (key === 'tick_id') return 'Идемпотентный идентификатор тика. Можно оставить пустым.';
+  if (key === 'time_scale') return 'Скорость симуляции в диапазоне [0.1..10.0].';
+  return `Поле тела запроса: ${niceKey(key)}.`;
+};
+
 const parseDefaultFields = (endpoint: EndpointDefinition): ParsedBodyDefaults => {
-  if (!endpoint.defaultBody) return { values: {}, template: {} };
+  if (!endpoint.defaultBody) return { values: {}, hiddenValues: {}, template: {} };
   try {
     const parsed = JSON.parse(endpoint.defaultBody) as Record<string, unknown>;
-    const values = Object.keys(parsed).reduce<Record<string, string>>((acc, key) => {
-      acc[key] = '';
-      return acc;
-    }, {});
+    const values: Record<string, string> = {};
+    const hiddenValues: Record<string, string> = {};
+    Object.keys(parsed).forEach((key) => {
+      if (SYSTEM_MANAGED_BODY_KEYS.has(key)) {
+        hiddenValues[key] = '';
+      } else {
+        values[key] = '';
+      }
+    });
 
-    return { values, template: parsed };
+    return { values, hiddenValues, template: parsed };
   } catch {
-    return { values: {}, template: {} };
+    return { values: {}, hiddenValues: {}, template: {} };
   }
 };
 
@@ -85,7 +118,7 @@ const isAgentParam = (endpoint: EndpointDefinition, param: EndpointParam) => {
 
 const isAgentBodyKey = (key: string) => key.includes('agent') || key.endsWith('_id_agent');
 
-const AgentInput = ({ value, onChange, className, directory }: AgentInputProps) => {
+const AgentInput = ({ value, onChange, className, directory, hint }: AgentInputProps) => {
   const [displayValue, setDisplayValue] = useState(() => findAgentById(directory, value)?.name ?? value);
   const [open, setOpen] = useState(false);
 
@@ -104,6 +137,8 @@ const AgentInput = ({ value, onChange, className, directory }: AgentInputProps) 
       <Input
         value={displayValue}
         className={className}
+        title={hint}
+        aria-label={hint}
         onFocus={() => setOpen(true)}
         onBlur={() => {
           window.setTimeout(() => setOpen(false), 120);
@@ -178,11 +213,17 @@ const coerceBodyValue = (raw: string, template: unknown): unknown => {
   return raw;
 };
 
-const buildRequestBody = (values: Record<string, string>, template: Record<string, unknown>) =>
-  Object.entries(values).reduce<Record<string, unknown>>((acc, [key, value]) => {
-    acc[key] = coerceBodyValue(value, template[key]);
+const buildRequestBody = (
+  values: Record<string, string>,
+  hiddenValues: Record<string, string>,
+  template: Record<string, unknown>
+) => {
+  const mergedValues = { ...values, ...hiddenValues };
+  return Object.keys(template).reduce<Record<string, unknown>>((acc, key) => {
+    acc[key] = coerceBodyValue(mergedValues[key] ?? '', template[key]);
     return acc;
   }, {});
+};
 
 const pickTimeScale = (payload: unknown) => {
   if (!payload || typeof payload !== 'object') return null;
@@ -402,13 +443,18 @@ const OperationCard = ({
   timeScale,
   onTimeScaleChange,
   accessToken,
+  operatorUserId,
   agentDirectory,
   onRun
 }: OperationCardProps) => {
   const bodyDefaults = useMemo(() => parseDefaultFields(endpoint), [endpoint]);
+  const visibleParams = useMemo(
+    () => (endpoint.params ?? []).filter((param) => !SYSTEM_MANAGED_BODY_KEYS.has(param.key)),
+    [endpoint.params]
+  );
 
   const [paramValues, setParamValues] = useState<Record<string, string>>(() =>
-    (endpoint.params ?? []).reduce<Record<string, string>>((acc, param) => {
+    visibleParams.reduce<Record<string, string>>((acc, param) => {
       acc[param.key] = '';
       return acc;
     }, {})
@@ -423,19 +469,29 @@ const OperationCard = ({
   }, [bodyDefaults]);
 
   const bodyKeys = Object.keys(bodyFields);
+  const resolvedHiddenBodyFields = useMemo(() => {
+    const next = { ...bodyDefaults.hiddenValues };
+    if (operatorUserId) {
+      if ('admin_user_id' in next) next.admin_user_id = operatorUserId;
+      if ('user_id' in next) next.user_id = operatorUserId;
+    }
+    return next;
+  }, [bodyDefaults.hiddenValues, operatorUserId]);
+  const hasAutoBodyFields = Object.keys(resolvedHiddenBodyFields).length > 0;
 
   const runAction = async () => {
     setIsRunning(true);
     const started = performance.now();
 
     const pathParams = (endpoint.params ?? [])
+      .filter((param) => !SYSTEM_MANAGED_BODY_KEYS.has(param.key))
       .filter((param) => param.kind === 'path')
       .reduce<Record<string, string>>((acc, param) => {
         acc[param.key] = paramValues[param.key] ?? '';
         return acc;
       }, {});
 
-    const queryParams = (endpoint.params ?? [])
+    const queryParams = visibleParams
       .filter((param) => param.kind === 'query')
       .reduce<QueryParams>((acc, param) => {
         const value = paramValues[param.key] ?? '';
@@ -464,8 +520,8 @@ const OperationCard = ({
           method: endpoint.method,
           query: queryParams,
           body:
-            endpoint.method === 'POST' && bodyKeys.length > 0
-              ? buildRequestBody(bodyFields, bodyDefaults.template)
+            endpoint.method === 'POST' && (bodyKeys.length > 0 || hasAutoBodyFields)
+              ? buildRequestBody(bodyFields, resolvedHiddenBodyFields, bodyDefaults.template)
               : undefined,
           accessToken
         });
@@ -510,14 +566,15 @@ const OperationCard = ({
         <p className="text-xs text-slate-300/80">{endpoint.summary}</p>
       </CardHeader>
       <CardContent className="space-y-3 p-4 pt-0">
-        {(endpoint.params ?? []).length > 0 ? (
+        {visibleParams.length > 0 ? (
           <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-            {endpoint.params?.map((param) => (
+            {visibleParams.map((param) => (
               <div key={param.key} className="space-y-1">
                 <Label>{param.label}</Label>
                 {isAgentParam(endpoint, param) ? (
                   <AgentInput
                     value={paramValues[param.key] ?? ''}
+                    hint={resolveParamHint(endpoint, param)}
                     onChange={(next) =>
                       setParamValues((prev) => ({
                         ...prev,
@@ -530,6 +587,8 @@ const OperationCard = ({
                 ) : (
                   <Input
                     value={paramValues[param.key] ?? ''}
+                    title={resolveParamHint(endpoint, param)}
+                    aria-label={resolveParamHint(endpoint, param)}
                     onChange={(event) =>
                       setParamValues((prev) => ({
                         ...prev,
@@ -565,10 +624,11 @@ const OperationCard = ({
           <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
             {bodyKeys.map((key) => (
               <div key={key} className="space-y-1">
-                <Label>{niceKey(key)}</Label>
+                <Label title={resolveBodyFieldHint(key)}>{niceKey(key)}</Label>
                 {isAgentBodyKey(key) ? (
                   <AgentInput
                     value={bodyFields[key] ?? ''}
+                    hint={resolveBodyFieldHint(key)}
                     onChange={(next) =>
                       setBodyFields((prev) => ({
                         ...prev,
@@ -581,6 +641,8 @@ const OperationCard = ({
                 ) : (
                   <Input
                     value={bodyFields[key] ?? ''}
+                    title={resolveBodyFieldHint(key)}
+                    aria-label={resolveBodyFieldHint(key)}
                     onChange={(event) =>
                       setBodyFields((prev) => ({
                         ...prev,
@@ -593,6 +655,10 @@ const OperationCard = ({
               </div>
             ))}
           </div>
+        ) : null}
+
+        {hasAutoBodyFields ? (
+          <p className="text-[11px] text-cyan-300/85">Служебный user/admin id подставляется автоматически из текущей сессии.</p>
         ) : null}
 
         <div className="flex items-center gap-2">
@@ -638,6 +704,7 @@ export const CategoryOperationsModal = ({
   timeScale,
   onClose,
   accessToken,
+  operatorUserId,
   agentDirectory,
   onTimeScaleChange,
   onRun
@@ -683,8 +750,13 @@ export const CategoryOperationsModal = ({
         </div>
         <Separator />
         <div className="p-5 pb-3">
-          <Label>Find operation</Label>
-          <Input value={search} onChange={(event) => setSearch(event.target.value)} className="mt-1" />
+          <Label title="Поиск по названию и описанию операции.">Find operation</Label>
+          <Input
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+            className="mt-1"
+            title="Введите часть названия или описания операции."
+          />
         </div>
         <div className="dashboard-scroll min-h-0 flex-1 overflow-y-auto overscroll-contain p-5 pt-2">
           <div className="grid gap-3 md:grid-cols-2">
@@ -694,6 +766,7 @@ export const CategoryOperationsModal = ({
                 endpoint={endpoint}
                 timeScale={timeScale}
                 accessToken={accessToken}
+                operatorUserId={operatorUserId}
                 agentDirectory={resolvedDirectory}
                 onTimeScaleChange={onTimeScaleChange}
                 onRun={onRun}

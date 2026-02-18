@@ -136,6 +136,16 @@ const parseStoredActivity = (): ActivityItem[] => {
   }
 };
 
+const SectionHint = ({ text }: { text: string }) => (
+  <span
+    className="inline-flex h-4 w-4 items-center justify-center rounded-full border border-cyan-300/55 text-[10px] font-bold text-cyan-200"
+    title={text}
+    aria-label={text}
+  >
+    ?
+  </span>
+);
+
 export const ApiSurfaceDashboard = () => {
   const { session, logout, refreshNow } = useAuth();
   const searchRef = useRef<HTMLInputElement | null>(null);
@@ -561,19 +571,27 @@ export const ApiSurfaceDashboard = () => {
 
           <div className="grid grid-cols-1 gap-2 md:grid-cols-[1.2fr_260px_auto]">
             <div className="space-y-1">
-              <Label>Search capabilities</Label>
+              <div className="flex items-center gap-1">
+                <Label>Search capabilities</Label>
+                <SectionHint text="Фильтр операций по названию и описанию. Быстрый доступ: клавиша /." />
+              </div>
               <Input
                 ref={searchRef}
                 value={search}
                 onChange={(event) => setSearch(event.target.value)}
+                title="Введите часть названия операции или описание."
               />
             </div>
             <div className="space-y-1">
-              <Label>Scope</Label>
+              <div className="flex items-center gap-1">
+                <Label>Scope</Label>
+                <SectionHint text="Ограничивает список операций выбранным доменом." />
+              </div>
               <select
                 value={selectedCategory}
                 onChange={(event) => setSelectedCategory(event.target.value as CategoryFilter)}
                 className="h-10 w-full rounded-md border border-white/15 bg-slate-900/70 px-3 text-sm text-slate-100"
+                title="Выберите домен API: system/simulation/events/agents и т.д."
               >
                 <option value="all">All domains</option>
                 {categoryEntries.map(([key, label]) => (
@@ -608,7 +626,10 @@ export const ApiSurfaceDashboard = () => {
             <GlassCard className="panel-sheen min-h-0 p-3">
               <div className="flex h-full flex-col gap-2">
                 <div>
-                  <h2 className="text-xs font-semibold uppercase tracking-wide text-slate-200">Domains</h2>
+                  <div className="flex items-center gap-1">
+                    <h2 className="text-xs font-semibold uppercase tracking-wide text-slate-200">Domains</h2>
+                    <SectionHint text="Список секций API. Нажмите секцию, чтобы открыть доступные операции." />
+                  </div>
                   <p className="text-[11px] text-slate-300/70">Open domain popup to run operations.</p>
                 </div>
 
@@ -642,7 +663,10 @@ export const ApiSurfaceDashboard = () => {
             <GlassCard className="panel-sheen min-h-0 p-3">
               <div className="mb-2 flex items-center justify-between">
                 <div>
-                  <h2 className="text-base font-semibold text-white">Relationship Graph</h2>
+                  <div className="flex items-center gap-1">
+                    <h2 className="text-base font-semibold text-white">Relationship Graph</h2>
+                    <SectionHint text="Граф связей между агентами. Ребра обновляются в реальном времени." />
+                  </div>
                   <p className="text-xs text-slate-300/80">Drag to rotate. Hover node or edge for details.</p>
                 </div>
                 <Button size="sm" variant="outline" onClick={() => setGraphExpanded(true)}>
@@ -662,7 +686,10 @@ export const ApiSurfaceDashboard = () => {
                 <Card className="border-white/10 bg-slate-900/60">
                   <CardContent className="flex h-full items-center justify-between p-3">
                     <div>
-                      <div className="text-xs text-slate-200">Events Stream</div>
+                      <div className="flex items-center gap-1 text-xs text-slate-200">
+                        <span>Events Stream</span>
+                        <SectionHint text="Поток доменных событий /ws/events. Live/Pause управляет подпиской." />
+                      </div>
                       <div className="text-[11px] text-slate-400">instant updates</div>
                     </div>
                     <Button
@@ -683,7 +710,10 @@ export const ApiSurfaceDashboard = () => {
                 <Card className="border-white/10 bg-slate-900/60">
                   <CardContent className="flex h-full items-center justify-between p-3">
                     <div>
-                      <div className="text-xs text-slate-200">Relationship Stream</div>
+                      <div className="flex items-center gap-1 text-xs text-slate-200">
+                        <span>Relationship Stream</span>
+                        <SectionHint text="Поток обновлений связей /ws/relationships. Обновляет ребра графа." />
+                      </div>
                       <div className="text-[11px] text-slate-400">edge updates</div>
                     </div>
                     <Button
@@ -709,7 +739,10 @@ export const ApiSurfaceDashboard = () => {
             <GlassCard className="panel-sheen min-h-0 p-3">
               <div className="flex h-full flex-col gap-3">
                 <div>
-                  <h2 className="text-xs font-semibold uppercase tracking-wide text-slate-200">Simulation Tempo</h2>
+                  <div className="flex items-center gap-1">
+                    <h2 className="text-xs font-semibold uppercase tracking-wide text-slate-200">Simulation Tempo</h2>
+                    <SectionHint text="Регулирует скорость фоновой симуляции (тики, доставка сообщений, mood decay)." />
+                  </div>
                   <p className="text-[11px] text-slate-300/75">Affects runtime only.</p>
                 </div>
 
@@ -740,7 +773,10 @@ export const ApiSurfaceDashboard = () => {
 
                 <div className="min-h-0 flex flex-1 flex-col">
                   <div className="mb-2 flex items-center justify-between">
-                    <h3 className="text-sm font-semibold text-white">Activity</h3>
+                    <div className="flex items-center gap-1">
+                      <h3 className="text-sm font-semibold text-white">Activity</h3>
+                      <SectionHint text="Лента действий панели и событий подключения/ошибок в текущей сессии." />
+                    </div>
                     <div className="flex gap-1">
                       <Button size="sm" variant="ghost" onClick={() => setActivityExpanded(true)}>
                         Open
@@ -811,6 +847,7 @@ export const ApiSurfaceDashboard = () => {
         onClose={() => setActiveCategoryModal(null)}
         timeScale={timeScale}
         accessToken={accessToken}
+        operatorUserId={session?.user.id}
         agentDirectory={agentDirectory}
         onTimeScaleChange={setTimeScale}
         onRun={pushActivity}
@@ -826,7 +863,10 @@ export const ApiSurfaceDashboard = () => {
           <GlassCard className="h-[92vh] w-[95vw] max-w-[1500px] p-4" onClick={(event) => event.stopPropagation()}>
             <div className="mb-3 flex items-center justify-between">
               <div>
-                <h3 className="text-lg font-semibold text-white">Relationship Graph</h3>
+                <div className="flex items-center gap-1">
+                  <h3 className="text-lg font-semibold text-white">Relationship Graph</h3>
+                  <SectionHint text="Расширенный режим визуализации связей и affinity между агентами." />
+                </div>
                 <p className="text-xs text-slate-300/80">Detailed scene mode. Double-click graph to reset camera.</p>
               </div>
               <Button variant="ghost" onClick={() => setGraphExpanded(false)}>
@@ -855,7 +895,10 @@ export const ApiSurfaceDashboard = () => {
             onClick={(event) => event.stopPropagation()}
           >
             <div className="mb-3 flex items-center justify-between">
-              <h3 className="text-lg font-semibold text-white">Full Activity Timeline</h3>
+              <div className="flex items-center gap-1">
+                <h3 className="text-lg font-semibold text-white">Full Activity Timeline</h3>
+                <SectionHint text="Полная история действий/событий UI за текущую сессию браузера." />
+              </div>
               <div className="flex gap-2">
                 <Button
                   variant="ghost"
