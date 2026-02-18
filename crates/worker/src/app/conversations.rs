@@ -23,6 +23,7 @@ pub(super) async fn seed_onboarding_conversation(
             peer.name, new_agent.name, topic
         );
         let content = compose_seed_message(
+            repository,
             llm,
             new_agent,
             peer,
@@ -47,6 +48,7 @@ pub(super) async fn seed_onboarding_conversation(
         left.name, new_agent.name, topic
     );
     let first_content = compose_seed_message(
+        repository,
         llm,
         new_agent,
         left,
@@ -62,6 +64,7 @@ pub(super) async fn seed_onboarding_conversation(
         new_agent.name
     );
     let second_content = compose_seed_message(
+        repository,
         llm,
         left,
         right,
@@ -77,6 +80,7 @@ pub(super) async fn seed_onboarding_conversation(
         new_agent.name, topic
     );
     let third_content = compose_seed_message(
+        repository,
         llm,
         right,
         new_agent,
@@ -117,6 +121,7 @@ pub(super) async fn seed_random_conversation(
             second.name, topic
         );
         let first_content = compose_seed_message(
+            repository,
             llm,
             first,
             second,
@@ -133,6 +138,7 @@ pub(super) async fn seed_random_conversation(
                 first.name
             );
             let second_content = compose_seed_message(
+                repository,
                 llm,
                 second,
                 first,
@@ -156,6 +162,7 @@ pub(super) async fn seed_random_conversation(
         b.name, topic
     );
     let first_content = compose_seed_message(
+        repository,
         llm,
         a,
         b,
@@ -171,6 +178,7 @@ pub(super) async fn seed_random_conversation(
         c.name, topic
     );
     let second_content = compose_seed_message(
+        repository,
         llm,
         b,
         c,
@@ -186,6 +194,7 @@ pub(super) async fn seed_random_conversation(
         a.name
     );
     let third_content = compose_seed_message(
+        repository,
         llm,
         c,
         a,
@@ -239,6 +248,7 @@ pub(super) fn pick_random_topic() -> &'static str {
 }
 
 async fn compose_seed_message(
+    repository: &dyn AgentCoreRepository,
     llm: Option<&dyn LlmPort>,
     sender: &AgentRecord,
     receiver: &AgentRecord,
@@ -246,8 +256,10 @@ async fn compose_seed_message(
     intent: &str,
     fallback: String,
 ) -> String {
+    let event_context = load_message_event_context(repository, sender.id, receiver.id).await;
+
     let Some(llm) = llm else {
-        return fallback;
+        return fallback_with_event_context(&fallback, &event_context);
     };
 
     let request = sim_backend::llm::LlmGenerateRequest {
@@ -257,13 +269,15 @@ async fn compose_seed_message(
         )),
         user_prompt: format!(
             "Sender: {} (personality: {}). Receiver: {} (personality: {}). Topic: {}. Intent: {}. \
+             Event context: {}. \
              Produce exactly one concise message to the receiver.",
             sender.name,
             sender.personality_json,
             receiver.name,
             receiver.personality_json,
             topic,
-            intent
+            intent,
+            event_context
         ),
         temperature: Some(0.7),
         max_output_tokens: Some(90),
@@ -278,7 +292,11 @@ async fn compose_seed_message(
                 model = %response.model,
                 "generated inter-agent seed message via llm"
             );
-            if text.is_empty() { fallback } else { text }
+            if text.is_empty() {
+                fallback_with_event_context(&fallback, &event_context)
+            } else {
+                text
+            }
         }
         Err(error) => {
             tracing::warn!(
@@ -287,7 +305,81 @@ async fn compose_seed_message(
                 error = %error,
                 "failed to generate llm conversation message, using deterministic fallback"
             );
-            fallback
+            fallback_with_event_context(&fallback, &event_context)
         }
     }
+}
+
+async fn load_message_event_context(
+    repository: &dyn AgentCoreRepository,
+    sender_id: Uuid,
+    receiver_id: Uuid,
+) -> String {
+    let global_events = match repository.list_agent_events(None, 20).await {
+        Ok(items) => items,
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to load global events for conversation context");
+            Vec::new()
+        }
+    };
+    let sender_events = match repository.list_agent_events(Some(sender_id), 4).await {
+        Ok(items) => items,
+        Err(error) => {
+            tracing::warn!(
+                sender_id = %sender_id,
+                error = %error,
+                "failed to load sender events for conversation context"
+            );
+            Vec::new()
+        }
+    };
+    let receiver_events = match repository.list_agent_events(Some(receiver_id), 4).await {
+        Ok(items) => items,
+        Err(error) => {
+            tracing::warn!(
+                receiver_id = %receiver_id,
+                error = %error,
+                "failed to load receiver events for conversation context"
+            );
+            Vec::new()
+        }
+    };
+
+    let mut lines: Vec<String> = Vec::new();
+    lines.extend(
+        global_events
+            .iter()
+            .filter(|event| event.event_type == "manual_event")
+            .take(2)
+            .map(|event| format!("world:{}: {}", event.event_type, trim_text(&event.description, 120))),
+    );
+    lines.extend(
+        sender_events
+            .iter()
+            .take(2)
+            .map(|event| format!("sender:{}: {}", event.event_type, trim_text(&event.description, 120))),
+    );
+    lines.extend(
+        receiver_events
+            .iter()
+            .take(2)
+            .map(|event| format!("receiver:{}: {}", event.event_type, trim_text(&event.description, 120))),
+    );
+
+    if lines.is_empty() {
+        "none".to_owned()
+    } else {
+        lines.join(" | ")
+    }
+}
+
+fn fallback_with_event_context(fallback: &str, event_context: &str) -> String {
+    if event_context == "none" {
+        return fallback.to_owned();
+    }
+    let concise_context = trim_text(event_context, 110);
+    trim_text(
+        &format!("{fallback} Context to consider: {concise_context}"),
+        CONVERSATION_MESSAGE_MAX_CHARS,
+    )
 }
