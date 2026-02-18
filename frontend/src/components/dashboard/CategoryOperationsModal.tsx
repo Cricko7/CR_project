@@ -54,10 +54,27 @@ interface ParsedBodyDefaults {
   template: Record<string, unknown>;
 }
 
+interface PersonalityTraitOption {
+  key: string;
+  label: string;
+}
+
 const SYSTEM_MANAGED_BODY_KEYS = new Set(['admin_user_id', 'user_id']);
 const DEFAULT_OPERATOR_USER_ID = 'dashboard-admin';
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const AGENT_ID_KEYS = new Set(['agent_id', 'sender_agent_id', 'receiver_agent_id']);
+const AGENT_PERSONALITY_TRAITS: PersonalityTraitOption[] = [
+  { key: 'curious', label: 'Curious' },
+  { key: 'friendly', label: 'Friendly' },
+  { key: 'analytical', label: 'Analytical' },
+  { key: 'empathetic', label: 'Empathetic' },
+  { key: 'creative', label: 'Creative' },
+  { key: 'disciplined', label: 'Disciplined' },
+  { key: 'bold', label: 'Bold' },
+  { key: 'skeptical', label: 'Skeptical' },
+  { key: 'calm', label: 'Calm' },
+  { key: 'leader', label: 'Leader' }
+];
 
 const isUuid = (value: string) => UUID_PATTERN.test(value.trim());
 
@@ -541,6 +558,9 @@ const OperationCard = ({
     }, {})
   );
   const [bodyFields, setBodyFields] = useState<Record<string, string>>(bodyDefaults.values);
+  const [createAgentName, setCreateAgentName] = useState('New Agent');
+  const [createAgentAvatarUrl, setCreateAgentAvatarUrl] = useState('');
+  const [createAgentTraits, setCreateAgentTraits] = useState<string[]>([]);
   const [interventionEvent, setInterventionEvent] = useState('');
   const [isRunning, setIsRunning] = useState(false);
   const [lastSummary, setLastSummary] = useState<string | null>(null);
@@ -557,6 +577,21 @@ const OperationCard = ({
     setInterventionEvent(description);
   }, [bodyDefaults.template, endpoint.id]);
 
+  useEffect(() => {
+    if (endpoint.id !== 'agent-create') return;
+    const defaultName = readString(bodyDefaults.template, 'name') || 'New Agent';
+    const defaultAvatar = readString(bodyDefaults.template, 'avatar_url');
+    const personality = asRecord(bodyDefaults.template.personality_json);
+    const rawTraits = Array.isArray(personality?.traits) ? personality?.traits : [];
+    const defaultTraits = rawTraits
+      .filter((value): value is string => typeof value === 'string')
+      .map((value) => value.trim().toLowerCase())
+      .filter((value) => value.length > 0);
+    setCreateAgentName(defaultName);
+    setCreateAgentAvatarUrl(defaultAvatar);
+    setCreateAgentTraits(Array.from(new Set(defaultTraits)));
+  }, [bodyDefaults.template, endpoint.id]);
+
   const bodyKeys = Object.keys(bodyFields);
   const resolvedHiddenBodyFields = useMemo(() => {
     const next = { ...bodyDefaults.hiddenValues };
@@ -566,6 +601,12 @@ const OperationCard = ({
     return next;
   }, [bodyDefaults.hiddenValues, operatorUserId]);
   const hasAutoBodyFields = Object.keys(resolvedHiddenBodyFields).length > 0;
+  const toggleCreateAgentTrait = (traitKey: string) => {
+    setCreateAgentTraits((prev) => {
+      if (prev.includes(traitKey)) return prev.filter((item) => item !== traitKey);
+      return [...prev, traitKey];
+    });
+  };
 
   const runAction = async () => {
     setIsRunning(true);
@@ -622,7 +663,13 @@ const OperationCard = ({
         onRun(`${endpoint.title} connected via backend WS (${Math.round(performance.now() - started)} ms)`);
       } else {
         let bodyPayload: unknown | undefined;
-        if (endpoint.method === 'POST' && (bodyKeys.length > 0 || hasAutoBodyFields)) {
+        if (
+          endpoint.method === 'POST' &&
+          (bodyKeys.length > 0 ||
+            hasAutoBodyFields ||
+            endpoint.id === 'interventions-create' ||
+            endpoint.id === 'agent-create')
+        ) {
           if (endpoint.id === 'interventions-create') {
             const trimmedEvent = interventionEvent.trim();
             if (!trimmedEvent.length) {
@@ -638,6 +685,31 @@ const OperationCard = ({
                 type: 'append_event',
                 event_type: 'manual_event',
                 description: trimmedEvent
+              }
+            };
+          } else if (endpoint.id === 'agent-create') {
+            const trimmedName = createAgentName.trim();
+            if (!trimmedName.length) {
+              setLastSummary(null);
+              setLastError('Поле "Name" не должно быть пустым.');
+              onRun(`${endpoint.title} failed: name is empty`);
+              setIsRunning(false);
+              return;
+            }
+
+            const normalizedTraits = Array.from(
+              new Set(
+                createAgentTraits
+                  .map((trait) => trait.trim().toLowerCase())
+                  .filter((trait) => trait.length > 0)
+              )
+            );
+            const avatarValue = createAgentAvatarUrl.trim();
+            bodyPayload = {
+              name: trimmedName,
+              avatar_url: avatarValue.length ? avatarValue : null,
+              personality_json: {
+                traits: normalizedTraits
               }
             };
           } else {
@@ -771,7 +843,63 @@ const OperationCard = ({
           </div>
         ) : null}
 
-        {bodyKeys.length > 0 && endpoint.id !== 'time-scale-set' && endpoint.id !== 'interventions-create' ? (
+        {endpoint.id === 'agent-create' ? (
+          <div className="space-y-3">
+            <div className="space-y-1">
+              <Label title="Имя нового агента.">Name</Label>
+              <Input
+                value={createAgentName}
+                title="Имя нового агента."
+                aria-label="Имя нового агента."
+                onChange={(event) => setCreateAgentName(event.target.value)}
+                className="h-8 text-xs"
+              />
+            </div>
+
+            <div className="space-y-1">
+              <Label title="URL аватара (опционально).">Avatar URL (optional)</Label>
+              <Input
+                value={createAgentAvatarUrl}
+                title="Ссылка на аватар. Можно оставить пустым."
+                aria-label="Ссылка на аватар."
+                onChange={(event) => setCreateAgentAvatarUrl(event.target.value)}
+                className="h-8 text-xs"
+              />
+            </div>
+
+            <div className="space-y-2">
+              <Label title="Выберите personality traits; фронт сам соберет personality_json.">Personality</Label>
+              <div className="grid grid-cols-2 gap-2">
+                {AGENT_PERSONALITY_TRAITS.map((trait) => {
+                  const selected = createAgentTraits.includes(trait.key);
+                  return (
+                    <button
+                      key={trait.key}
+                      type="button"
+                      onClick={() => toggleCreateAgentTrait(trait.key)}
+                      className={cn(
+                        'h-8 rounded-md border px-2 text-left text-xs transition-colors',
+                        selected
+                          ? 'border-cyan-300/65 bg-cyan-500/20 text-cyan-100'
+                          : 'border-white/15 bg-slate-900/70 text-slate-200 hover:bg-slate-800/70'
+                      )}
+                    >
+                      {trait.label}
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="text-[11px] text-slate-400">
+                Отправится: personality_json = {"{ \"traits\": [...] }"}
+              </p>
+            </div>
+          </div>
+        ) : null}
+
+        {bodyKeys.length > 0 &&
+        endpoint.id !== 'time-scale-set' &&
+        endpoint.id !== 'interventions-create' &&
+        endpoint.id !== 'agent-create' ? (
           <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
             {bodyKeys.map((key) => (
               <div key={key} className="space-y-1">
