@@ -173,25 +173,24 @@ export const API_ENDPOINTS: EndpointDefinition[] = [
     kind: 'rest',
     method: 'POST',
     path: '/interventions',
-    summary: 'Admin intervention action hub.',
+    summary: 'Append a manual event to the timeline.',
     defaultBody: toJson({
       admin_user_id: 'demo-admin',
       action: {
-        type: 'send_message',
-        sender_agent_id: DEMO_AGENT_A,
-        receiver_agent_id: DEMO_AGENT_B,
-        content: 'Hold position and report status.'
+        type: 'append_event',
+        event_type: 'manual_event',
+        description: 'Manual dashboard event.'
       }
     }),
     sampleResponse: toJson({
       intervention: {
         id: 21,
         admin_user_id: 'demo-admin',
-        action_type: 'send_message',
+        action_type: 'append_event',
         result_status: 'applied',
         created_at: '2026-02-16T12:00:00Z'
       },
-      effect: { type: 'message', message_id: 77, status: 'queued' }
+      effect: { type: 'event', event_id: 328, event_type: 'manual_event' }
     })
   },
   {

@@ -55,41 +55,91 @@ interface ParsedBodyDefaults {
 }
 
 const SYSTEM_MANAGED_BODY_KEYS = new Set(['admin_user_id', 'user_id']);
+const DEFAULT_OPERATOR_USER_ID = 'dashboard-admin';
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const AGENT_ID_KEYS = new Set(['agent_id', 'sender_agent_id', 'receiver_agent_id']);
 
 const isUuid = (value: string) => UUID_PATTERN.test(value.trim());
 
-const findInvalidAgentIdPath = (value: unknown, path = ''): string | null => {
+type AgentResolveError = 'not_found' | 'ambiguous';
+
+interface AgentResolveResult {
+  resolved: string;
+  error: AgentResolveError | null;
+}
+
+interface BodyAgentResolveResult {
+  payload: unknown;
+  errorPath: string | null;
+  error: AgentResolveError | null;
+}
+
+const resolveAgentIdentifier = (directory: AgentDirectoryEntry[], rawValue: string): AgentResolveResult => {
+  const trimmed = rawValue.trim();
+  if (!trimmed.length) return { resolved: '', error: null };
+  if (isUuid(trimmed)) return { resolved: trimmed, error: null };
+
+  const exact = findAgentByName(directory, trimmed);
+  if (exact) return { resolved: exact.id, error: null };
+
+  const normalized = trimmed.toLowerCase();
+  const partial = directory.filter((agent) => agent.name.toLowerCase().includes(normalized));
+  if (partial.length === 1) return { resolved: partial[0].id, error: null };
+  if (partial.length > 1) return { resolved: '', error: 'ambiguous' };
+  return { resolved: '', error: 'not_found' };
+};
+
+const buildAgentResolveErrorText = (fieldLabel: string, error: AgentResolveError) => {
+  if (error === 'ambiguous') {
+    return `Поле "${fieldLabel}": найдено несколько агентов. Выберите имя из автокомплита.`;
+  }
+  return `Поле "${fieldLabel}": агент не найден. Выберите имя из автокомплита.`;
+};
+
+const resolveAgentIdentifiersInBody = (
+  value: unknown,
+  directory: AgentDirectoryEntry[],
+  path = ''
+): BodyAgentResolveResult => {
   if (Array.isArray(value)) {
+    const nextArray: unknown[] = [];
     for (let index = 0; index < value.length; index += 1) {
       const nextPath = `${path}[${index}]`;
-      const found = findInvalidAgentIdPath(value[index], nextPath);
-      if (found) return found;
+      const result = resolveAgentIdentifiersInBody(value[index], directory, nextPath);
+      if (result.errorPath) return result;
+      nextArray.push(result.payload);
     }
-    return null;
+    return { payload: nextArray, errorPath: null, error: null };
   }
 
-  if (!value || typeof value !== 'object') return null;
+  if (!value || typeof value !== 'object') return { payload: value, errorPath: null, error: null };
   const record = value as Record<string, unknown>;
+  const nextRecord: Record<string, unknown> = {};
 
   for (const [key, nested] of Object.entries(record)) {
     const nextPath = path ? `${path}.${key}` : key;
     if (AGENT_ID_KEYS.has(key)) {
-      if (typeof nested !== 'string' || !isUuid(nested)) return nextPath;
+      if (typeof nested !== 'string') {
+        return { payload: value, errorPath: nextPath, error: 'not_found' };
+      }
+      const resolved = resolveAgentIdentifier(directory, nested);
+      if (resolved.error) return { payload: value, errorPath: nextPath, error: resolved.error };
+      nextRecord[key] = resolved.resolved;
       continue;
     }
 
-    const found = findInvalidAgentIdPath(nested, nextPath);
-    if (found) return found;
+    const nestedResult = resolveAgentIdentifiersInBody(nested, directory, nextPath);
+    if (nestedResult.errorPath) return nestedResult;
+    nextRecord[key] = nestedResult.payload;
   }
 
-  return null;
+  return { payload: nextRecord, errorPath: null, error: null };
 };
 
 const resolveParamHint = (endpoint: EndpointDefinition, param: EndpointParam) => {
-  if (param.key === 'id' && endpoint.path.includes('/agents/{id}')) return 'UUID агента, для которого выполняется операция.';
-  if (param.key === 'agent_id') return 'Опциональный фильтр по UUID агента.';
+  if (param.key === 'id' && endpoint.path.includes('/agents/{id}'))
+    return 'Имя агента с автокомплитом. UUID подставится автоматически.';
+  if (param.key === 'agent_id') return 'Опциональный фильтр по имени агента. UUID подставится автоматически.';
   if (param.key === 'limit') return 'Максимальное число элементов в ответе.';
   if (param.key === 'snapshot_limit') return 'Сколько последних записей отдать в начальном snapshot.';
   if (param.key === 'after_id') return 'Курсор для пагинации событий: вернуть записи с id > after_id.';
@@ -101,8 +151,8 @@ const resolveParamHint = (endpoint: EndpointDefinition, param: EndpointParam) =>
 
 const resolveBodyFieldHint = (key: string) => {
   if (key === 'admin_user_id' || key === 'user_id') return 'Заполняется автоматически из вашей текущей сессии.';
-  if (key === 'sender_agent_id') return 'UUID агента-отправителя.';
-  if (key === 'receiver_agent_id') return 'UUID агента-получателя.';
+  if (key === 'sender_agent_id') return 'Имя агента-отправителя с автокомплитом.';
+  if (key === 'receiver_agent_id') return 'Имя агента-получателя с автокомплитом.';
   if (key === 'content') return 'Текст сообщения/памяти/события.';
   if (key === 'tick_id') return 'Идемпотентный идентификатор тика. Можно оставить пустым.';
   if (key === 'time_scale') return 'Скорость симуляции в диапазоне [0.1..10.0].';
@@ -181,7 +231,7 @@ const AgentInput = ({ value, onChange, className, directory, hint }: AgentInputP
 
           const byName = findAgentByName(directory, next.trim());
           if (byName) {
-            onChange(byName.id);
+            onChange(byName.name);
             return;
           }
 
@@ -201,7 +251,7 @@ const AgentInput = ({ value, onChange, className, directory, hint }: AgentInputP
                 onMouseDown={(event) => {
                   event.preventDefault();
                   setDisplayValue(agent.name);
-                  onChange(agent.id);
+                  onChange(agent.name);
                   setOpen(false);
                 }}
               >
@@ -491,6 +541,7 @@ const OperationCard = ({
     }, {})
   );
   const [bodyFields, setBodyFields] = useState<Record<string, string>>(bodyDefaults.values);
+  const [interventionEvent, setInterventionEvent] = useState('');
   const [isRunning, setIsRunning] = useState(false);
   const [lastSummary, setLastSummary] = useState<string | null>(null);
   const [lastError, setLastError] = useState<string | null>(null);
@@ -499,13 +550,19 @@ const OperationCard = ({
     setBodyFields(bodyDefaults.values);
   }, [bodyDefaults]);
 
+  useEffect(() => {
+    if (endpoint.id !== 'interventions-create') return;
+    const action = asRecord(bodyDefaults.template.action);
+    const description = action ? readString(action, 'description') : '';
+    setInterventionEvent(description);
+  }, [bodyDefaults.template, endpoint.id]);
+
   const bodyKeys = Object.keys(bodyFields);
   const resolvedHiddenBodyFields = useMemo(() => {
     const next = { ...bodyDefaults.hiddenValues };
-    if (operatorUserId) {
-      if ('admin_user_id' in next) next.admin_user_id = operatorUserId;
-      if ('user_id' in next) next.user_id = operatorUserId;
-    }
+    const resolvedOperator = operatorUserId?.trim() || DEFAULT_OPERATOR_USER_ID;
+    if ('admin_user_id' in next) next.admin_user_id = resolvedOperator;
+    if ('user_id' in next) next.user_id = resolvedOperator;
     return next;
   }, [bodyDefaults.hiddenValues, operatorUserId]);
   const hasAutoBodyFields = Object.keys(resolvedHiddenBodyFields).length > 0;
@@ -514,37 +571,42 @@ const OperationCard = ({
     setIsRunning(true);
     const started = performance.now();
 
-    const pathParams = (endpoint.params ?? [])
-      .filter((param) => !SYSTEM_MANAGED_BODY_KEYS.has(param.key))
+    const resolvedParamValues: Record<string, string> = {};
+    for (const param of visibleParams) {
+      const rawValue = paramValues[param.key] ?? '';
+      if (!isAgentParam(endpoint, param) || !rawValue.trim().length) {
+        resolvedParamValues[param.key] = rawValue;
+        continue;
+      }
+
+      const resolved = resolveAgentIdentifier(agentDirectory, rawValue);
+      if (resolved.error) {
+        setLastSummary(null);
+        setLastError(buildAgentResolveErrorText(param.label, resolved.error));
+        onRun(`${endpoint.title} failed: unresolved agent in ${param.key}`);
+        setIsRunning(false);
+        return;
+      }
+      resolvedParamValues[param.key] = resolved.resolved;
+    }
+
+    const pathParams = visibleParams
       .filter((param) => param.kind === 'path')
       .reduce<Record<string, string>>((acc, param) => {
-        acc[param.key] = paramValues[param.key] ?? '';
+        acc[param.key] = resolvedParamValues[param.key] ?? '';
         return acc;
       }, {});
 
     const queryParams = visibleParams
       .filter((param) => param.kind === 'query')
       .reduce<QueryParams>((acc, param) => {
-        const value = paramValues[param.key] ?? '';
+        const value = resolvedParamValues[param.key] ?? '';
         if (!value.trim().length) return acc;
         acc[param.key] = value;
         return acc;
       }, {});
 
     const resolvedPath = resolvePathTemplate(endpoint.path, pathParams);
-    const invalidPathParam = visibleParams.find((param) => {
-      if (!isAgentParam(endpoint, param)) return false;
-      const value = (paramValues[param.key] ?? '').trim();
-      if (!value.length) return false;
-      return !isUuid(value);
-    });
-    if (invalidPathParam) {
-      setLastSummary(null);
-      setLastError(`Поле "${invalidPathParam.label}" должно быть UUID.`);
-      onRun(`${endpoint.title} failed: invalid UUID in ${invalidPathParam.key}`);
-      setIsRunning(false);
-      return;
-    }
 
     try {
       if (endpoint.kind === 'ws') {
@@ -559,15 +621,37 @@ const OperationCard = ({
         setLastError(null);
         onRun(`${endpoint.title} connected via backend WS (${Math.round(performance.now() - started)} ms)`);
       } else {
-        const bodyPayload =
-          endpoint.method === 'POST' && (bodyKeys.length > 0 || hasAutoBodyFields)
-            ? buildRequestBody(bodyFields, resolvedHiddenBodyFields, bodyDefaults.template)
-            : undefined;
-        const invalidBodyPath = bodyPayload ? findInvalidAgentIdPath(bodyPayload) : null;
-        if (invalidBodyPath) {
+        let bodyPayload: unknown | undefined;
+        if (endpoint.method === 'POST' && (bodyKeys.length > 0 || hasAutoBodyFields)) {
+          if (endpoint.id === 'interventions-create') {
+            const trimmedEvent = interventionEvent.trim();
+            if (!trimmedEvent.length) {
+              setLastSummary(null);
+              setLastError('Поле "Event" не должно быть пустым.');
+              onRun(`${endpoint.title} failed: event is empty`);
+              setIsRunning(false);
+              return;
+            }
+            bodyPayload = {
+              admin_user_id: resolvedHiddenBodyFields.admin_user_id ?? DEFAULT_OPERATOR_USER_ID,
+              action: {
+                type: 'append_event',
+                event_type: 'manual_event',
+                description: trimmedEvent
+              }
+            };
+          } else {
+            bodyPayload = buildRequestBody(bodyFields, resolvedHiddenBodyFields, bodyDefaults.template);
+          }
+        }
+
+        const bodyResolution = bodyPayload
+          ? resolveAgentIdentifiersInBody(bodyPayload, agentDirectory)
+          : { payload: undefined, errorPath: null, error: null };
+        if (bodyResolution.errorPath && bodyResolution.error) {
           setLastSummary(null);
-          setLastError(`Поле "${invalidBodyPath}" должно быть UUID.`);
-          onRun(`${endpoint.title} failed: invalid UUID in ${invalidBodyPath}`);
+          setLastError(buildAgentResolveErrorText(bodyResolution.errorPath, bodyResolution.error));
+          onRun(`${endpoint.title} failed: unresolved agent in ${bodyResolution.errorPath}`);
           setIsRunning(false);
           return;
         }
@@ -576,7 +660,7 @@ const OperationCard = ({
           path: resolvedPath,
           method: endpoint.method,
           query: queryParams,
-          body: bodyPayload,
+          body: bodyResolution.payload,
           accessToken
         });
 
@@ -674,7 +758,20 @@ const OperationCard = ({
           </div>
         ) : null}
 
-        {bodyKeys.length > 0 && endpoint.id !== 'time-scale-set' ? (
+        {endpoint.id === 'interventions-create' ? (
+          <div className="space-y-1">
+            <Label title="Введите описание события, которое нужно добавить в ленту.">Event</Label>
+            <Input
+              value={interventionEvent}
+              title="Текст события для append_event."
+              aria-label="Текст события для append_event."
+              onChange={(event) => setInterventionEvent(event.target.value)}
+              className="h-8 text-xs"
+            />
+          </div>
+        ) : null}
+
+        {bodyKeys.length > 0 && endpoint.id !== 'time-scale-set' && endpoint.id !== 'interventions-create' ? (
           <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
             {bodyKeys.map((key) => (
               <div key={key} className="space-y-1">
