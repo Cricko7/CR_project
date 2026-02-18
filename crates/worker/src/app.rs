@@ -149,7 +149,8 @@ pub async fn run() -> anyhow::Result<()> {
 
     let postgres_agent_repository = Arc::new(PostgresAgentCoreRepository::new(db_pool));
     let repository: Arc<dyn AgentCoreRepository> = postgres_agent_repository.clone();
-    let orchestrator = AgentTickOrchestrator::new(repository.clone()).with_optional_llm(llm_client);
+    let orchestrator =
+        AgentTickOrchestrator::new(repository.clone()).with_optional_llm(llm_client.clone());
 
     let mut runtime = ServiceRuntime::new(
         config.common.service_name.clone(),
@@ -198,6 +199,7 @@ pub async fn run() -> anyhow::Result<()> {
     spawn_conversation_seed_worker(
         &mut runtime,
         repository.clone(),
+        llm_client.clone(),
         config.conversation_scan_interval,
         config.conversation_min_interval,
         config.conversation_max_interval,

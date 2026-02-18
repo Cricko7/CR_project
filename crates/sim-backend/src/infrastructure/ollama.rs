@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -7,12 +8,14 @@ use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
 
 use crate::app::config::OllamaConfig;
+use crate::infrastructure::ollama_rate_limiter::{OllamaRateLimiter, shared_ollama_rate_limiter};
 use crate::llm::{LlmGenerateRequest, LlmGenerateResponse, LlmPort};
 
 #[derive(Clone)]
 pub struct OllamaClient {
     config: OllamaConfig,
     http: Client,
+    rate_limiter: Arc<OllamaRateLimiter>,
 }
 
 impl OllamaClient {
@@ -21,7 +24,12 @@ impl OllamaClient {
             .timeout(config.timeout)
             .build()
             .context("failed to build HTTP client for Ollama")?;
-        Ok(Self { config, http })
+        let rate_limiter = shared_ollama_rate_limiter(config.min_request_interval);
+        Ok(Self {
+            config,
+            http,
+            rate_limiter,
+        })
     }
 
     fn endpoint(&self) -> String {
@@ -44,6 +52,7 @@ impl LlmPort for OllamaClient {
         let mut last_error: Option<anyhow::Error> = None;
 
         for attempt in 0..=self.config.max_retries {
+            self.rate_limiter.wait_turn().await;
             let response = self.http.post(&endpoint).json(&payload).send().await;
 
             match response {

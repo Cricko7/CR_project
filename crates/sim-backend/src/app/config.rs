@@ -52,6 +52,7 @@ const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434";
 const DEFAULT_OLLAMA_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_OLLAMA_MAX_RETRIES: u32 = 1;
 const DEFAULT_OLLAMA_RETRY_BACKOFF_MS: u64 = 500;
+const DEFAULT_OLLAMA_MIN_REQUEST_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_QDRANT_URL: &str = "http://localhost:6333";
 const DEFAULT_QDRANT_COLLECTION: &str = "agent_memories";
 const DEFAULT_QDRANT_TIMEOUT_MS: u64 = 5_000;
@@ -111,6 +112,7 @@ pub struct OllamaConfig {
     pub timeout: Duration,
     pub max_retries: u32,
     pub retry_backoff: Duration,
+    pub min_request_interval: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -652,6 +654,10 @@ fn load_ollama_config() -> Result<Option<OllamaConfig>, ConfigError> {
     let max_retries: u32 = parse_env("OLLAMA_MAX_RETRIES", DEFAULT_OLLAMA_MAX_RETRIES)?;
     let retry_backoff_ms: u64 =
         parse_env("OLLAMA_RETRY_BACKOFF_MS", DEFAULT_OLLAMA_RETRY_BACKOFF_MS)?;
+    let min_request_interval_ms: u64 = parse_env(
+        "OLLAMA_MIN_REQUEST_INTERVAL_MS",
+        DEFAULT_OLLAMA_MIN_REQUEST_INTERVAL_MS,
+    )?;
 
     if base_url.trim().is_empty() {
         return Err(ConfigError::invalid("OLLAMA_BASE_URL", "must not be empty"));
@@ -675,6 +681,7 @@ fn load_ollama_config() -> Result<Option<OllamaConfig>, ConfigError> {
         timeout: Duration::from_millis(timeout_ms),
         max_retries,
         retry_backoff: Duration::from_millis(retry_backoff_ms),
+        min_request_interval: Duration::from_millis(min_request_interval_ms),
     }))
 }
 

@@ -123,6 +123,7 @@ flowchart LR
 - Текущее состояние:
   - есть enqueue/list API для межагентных сообщений;
   - worker conversation seeder автоматически инициирует случайные разговоры между 2-3 агентами;
+  - тексты auto-seeded сообщений генерируются через LLM (Gemini/OpenRouter/Ollama chain) с deterministic fallback только при ошибке LLM;
   - при появлении нового агента worker автоматически стартует onboarding-диалог с другими агентами (включая 3-сторонний сценарий при наличии двух peers);
   - worker delivery loop обрабатывает очередь сообщений и пишет delivery events;
   - при доставке сообщения обновляется relationship score/history между агентами.
@@ -283,7 +284,7 @@ CR_project/
 ### 7.5 Message/relationship flow
 1. Источник сообщения:
    - API `POST /agents/{receiver_id}/messages`, или
-   - auto-seeder воркера (random conversation/onboarding новых агентов).
+   - auto-seeder воркера (random conversation/onboarding новых агентов, контент генерируется LLM).
 2. Сообщение добавляется в `messages` со статусом `queued`.
 3. Worker `message_delivery_worker` claim'ит queued batch (`FOR UPDATE SKIP LOCKED`) и переводит в `processing`.
 4. Для каждой записи:
@@ -1055,6 +1056,7 @@ Payload в point:
 | `OLLAMA_TIMEOUT_MS` | `60000` |
 | `OLLAMA_MAX_RETRIES` | `1` |
 | `OLLAMA_RETRY_BACKOFF_MS` | `500` |
+| `OLLAMA_MIN_REQUEST_INTERVAL_MS` | `5000` |
 
 ### 10.7 Qdrant
 
@@ -1183,6 +1185,7 @@ set OPENROUTER_MIN_REQUEST_INTERVAL_MS=15000
 set OLLAMA_MODEL=llama3.1:8b-instruct-q4_K_M
 set OLLAMA_BASE_URL=http://localhost:11434
 set OLLAMA_TIMEOUT_MS=60000
+set OLLAMA_MIN_REQUEST_INTERVAL_MS=5000
 ```
 
 Если заданы `GEMINI_API_KEY`, `OPENROUTER_API_KEY` и `OLLAMA_MODEL`:
@@ -1211,6 +1214,9 @@ set OLLAMA_TIMEOUT_MS=60000
 
 `OLLAMA_MODEL` включает локальный Ollama-клиент. Если сервис запущен в Docker, для доступа
 к Ollama на хосте обычно нужен `OLLAMA_BASE_URL=http://host.docker.internal:11434`.
+
+`OLLAMA_MIN_REQUEST_INTERVAL_MS` задает минимальный интервал между запросами к локальной
+Ollama-модели в рамках одного процесса (API или worker). Установите `0`, чтобы отключить throttling.
 
 ### 11.4 Запуск сервисов
 

@@ -3,6 +3,7 @@ use super::*;
 pub(crate) fn spawn_conversation_seed_worker(
     runtime: &mut ServiceRuntime,
     conversation_repository: Arc<dyn AgentCoreRepository>,
+    llm: Option<Arc<dyn LlmPort>>,
     conversation_scan_interval: Duration,
     conversation_min_interval: Duration,
     conversation_max_interval: Duration,
@@ -51,7 +52,14 @@ pub(crate) fn spawn_conversation_seed_worker(
                     known_agent_ids = current_ids;
 
                     for new_agent in &new_agents {
-                        match seed_onboarding_conversation(conversation_repository.as_ref(), new_agent, &agents).await {
+                        match seed_onboarding_conversation(
+                            conversation_repository.as_ref(),
+                            new_agent,
+                            &agents,
+                            llm.as_deref(),
+                        )
+                        .await
+                        {
                             Ok(enqueued) if enqueued > 0 => {
                                 tracing::info!(
                                     agent_id = %new_agent.id,
@@ -72,7 +80,13 @@ pub(crate) fn spawn_conversation_seed_worker(
                     }
 
                     if tokio::time::Instant::now() >= random_due_at {
-                        match seed_random_conversation(conversation_repository.as_ref(), &agents).await {
+                        match seed_random_conversation(
+                            conversation_repository.as_ref(),
+                            &agents,
+                            llm.as_deref(),
+                        )
+                        .await
+                        {
                             Ok(enqueued) if enqueued > 0 => {
                                 tracing::debug!(enqueued_messages = enqueued, "seeded random conversation");
                             }
