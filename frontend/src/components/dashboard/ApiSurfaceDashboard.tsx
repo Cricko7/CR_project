@@ -10,6 +10,7 @@ import { CategoryOperationsModal } from './CategoryOperationsModal';
 import type { EndpointCategory, Graph3DEdge, Graph3DNode } from './types';
 
 type CategoryFilter = 'all' | EndpointCategory;
+type LifeFeedFilter = 'all' | 'communication' | 'messages' | 'relationships' | 'ticks' | 'manual';
 
 interface ActivityItem {
   id: string;
@@ -80,6 +81,11 @@ interface InspectorDto {
     importance: number;
     created_at: string;
   }>;
+}
+
+interface LifeFeedFilterOption {
+  id: LifeFeedFilter;
+  label: string;
 }
 
 type WsEventsMessage =
@@ -165,6 +171,14 @@ const pickTimeScale = (payload: unknown) => {
 };
 
 const FEED_LIMIT = 80;
+const LIFE_FEED_FILTER_OPTIONS: LifeFeedFilterOption[] = [
+  { id: 'all', label: 'All' },
+  { id: 'communication', label: 'Communication' },
+  { id: 'messages', label: 'Messages' },
+  { id: 'relationships', label: 'Relationships' },
+  { id: 'ticks', label: 'Ticks' },
+  { id: 'manual', label: 'Manual' }
+];
 
 const parseEventPayload = (payload?: string) => {
   if (!payload || typeof payload !== 'string') return null;
@@ -198,6 +212,18 @@ const normalizeFeedItem = (item: WsEventItemDto): LifeFeedItem => ({
   occurredAt: item.occurred_at ?? new Date().toISOString(),
   moodLabel: extractMoodLabel(item.payload)
 });
+
+const matchesLifeFeedFilter = (item: LifeFeedItem, filter: LifeFeedFilter) => {
+  if (filter === 'all') return true;
+  const eventType = item.eventType.toLowerCase();
+  if (filter === 'communication') {
+    return eventType.includes('message') || eventType.includes('relationship');
+  }
+  if (filter === 'messages') return eventType.includes('message');
+  if (filter === 'relationships') return eventType.includes('relationship');
+  if (filter === 'ticks') return eventType.includes('tick');
+  return eventType.includes('manual');
+};
 
 const initials = (name: string) =>
   name
@@ -299,6 +325,7 @@ export const ApiSurfaceDashboard = () => {
     Record<string, { name: string; avatarUrl: string | null }>
   >({});
   const [lifeFeed, setLifeFeed] = useState<LifeFeedItem[]>([]);
+  const [lifeFeedFilter, setLifeFeedFilter] = useState<LifeFeedFilter>('all');
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [inspectorLoading, setInspectorLoading] = useState(false);
   const [inspectorData, setInspectorData] = useState<InspectorDto | null>(null);
@@ -738,7 +765,11 @@ export const ApiSurfaceDashboard = () => {
     }
   }, [agentDirectory, messageReceiverId, messageSenderId]);
 
-  const feedPreview = useMemo(() => lifeFeed.slice(0, 14), [lifeFeed]);
+  const filteredLifeFeed = useMemo(
+    () => lifeFeed.filter((item) => matchesLifeFeedFilter(item, lifeFeedFilter)),
+    [lifeFeed, lifeFeedFilter]
+  );
+  const feedPreview = useMemo(() => filteredLifeFeed.slice(0, 14), [filteredLifeFeed]);
   const decisionPlan = useMemo(
     () => (inspectorData ? readDecisionPlan(inspectorData.recent_events) : null),
     [inspectorData]
@@ -1192,10 +1223,26 @@ export const ApiSurfaceDashboard = () => {
                       </Button>
                     </div>
                   </div>
+                  <div className="mb-2 flex flex-wrap items-center gap-1">
+                    {LIFE_FEED_FILTER_OPTIONS.map((option) => (
+                      <Button
+                        key={`feed-filter-${option.id}`}
+                        size="sm"
+                        variant={lifeFeedFilter === option.id ? 'secondary' : 'outline'}
+                        className="h-7 px-2 text-[11px]"
+                        onClick={() => setLifeFeedFilter(option.id)}
+                      >
+                        {option.label}
+                      </Button>
+                    ))}
+                    <Badge variant="outline">{filteredLifeFeed.length}</Badge>
+                  </div>
                   <div className="dashboard-scroll min-h-0 flex-1 space-y-2 overflow-y-auto pr-1">
                     {feedPreview.length === 0 ? (
                       <Card className="border-dashed border-white/20 bg-slate-900/50">
-                        <CardContent className="p-3 text-xs text-slate-300/80">No live events yet.</CardContent>
+                        <CardContent className="p-3 text-xs text-slate-300/80">
+                          No events for selected filter.
+                        </CardContent>
                       </Card>
                     ) : (
                       feedPreview.map((item) => {
@@ -1347,13 +1394,29 @@ export const ApiSurfaceDashboard = () => {
                 </Button>
               </div>
             </div>
+            <div className="mb-3 flex flex-wrap items-center gap-1">
+              {LIFE_FEED_FILTER_OPTIONS.map((option) => (
+                <Button
+                  key={`modal-feed-filter-${option.id}`}
+                  size="sm"
+                  variant={lifeFeedFilter === option.id ? 'secondary' : 'outline'}
+                  className="h-7 px-2 text-[11px]"
+                  onClick={() => setLifeFeedFilter(option.id)}
+                >
+                  {option.label}
+                </Button>
+              ))}
+              <Badge variant="outline">{filteredLifeFeed.length}</Badge>
+            </div>
             <div className="dashboard-scroll min-h-0 flex-1 space-y-2 overflow-y-auto overscroll-contain pr-1">
-              {lifeFeed.length === 0 ? (
+              {filteredLifeFeed.length === 0 ? (
                 <Card className="border-dashed border-white/20 bg-slate-900/50">
-                  <CardContent className="p-3 text-sm text-slate-300/80">No live events yet.</CardContent>
+                  <CardContent className="p-3 text-sm text-slate-300/80">
+                    No events for selected filter.
+                  </CardContent>
                 </Card>
               ) : (
-                lifeFeed.map((item) => {
+                filteredLifeFeed.map((item) => {
                   const agent = resolveAgentDisplay(item.agentId);
                   const mood = moodMeta(item.moodLabel);
                   return (
