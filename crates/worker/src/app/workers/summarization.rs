@@ -6,6 +6,8 @@ pub(crate) fn spawn_memory_summarization_worker(
     summary_max_active: u32,
     summary_batch_size: u32,
     summary_agent_ids: Vec<Uuid>,
+    summary_agent_limit: u32,
+    summary_repository: Arc<dyn AgentCoreRepository>,
     summary_service: Arc<MemoryService>,
 ) {
     let summary_token = runtime.cancellation_token();
@@ -18,9 +20,28 @@ pub(crate) fn spawn_memory_summarization_worker(
                     break;
                 }
                 _ = interval.tick() => {
+                    let mut agent_ids = HashSet::new();
                     for agent_id in &summary_agent_ids {
+                        agent_ids.insert(*agent_id);
+                    }
+
+                    match summary_repository.list_agents(summary_agent_limit).await {
+                        Ok(agents) => {
+                            for agent in agents {
+                                agent_ids.insert(agent.id);
+                            }
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                error = %error,
+                                "memory summarization worker failed to list agents"
+                            );
+                        }
+                    }
+
+                    for agent_id in agent_ids {
                         match summary_service
-                            .summarize_overflow(*agent_id, summary_max_active, summary_batch_size)
+                            .summarize_overflow(agent_id, summary_max_active, summary_batch_size)
                             .await
                         {
                             Ok(result) if result.created_summary => {

@@ -172,6 +172,17 @@ pub(crate) async fn build_relationship_graph(
         participant_ids.insert(edge.agent_b);
     }
 
+    if let Some(agent_id) = agent_id {
+        participant_ids.insert(agent_id);
+    }
+
+    if participant_ids.is_empty() {
+        let agents = state.repository.list_agents(limit_edges).await?;
+        for agent in agents {
+            participant_ids.insert(agent.id);
+        }
+    }
+
     let mut nodes = Vec::with_capacity(participant_ids.len());
     for participant_id in participant_ids {
         let agent = state.repository.get_agent(participant_id).await?;

@@ -20,6 +20,7 @@ interface ActivityItem {
 interface RelationshipGraphNodeDto {
   agent_id: string;
   name: string;
+  avatar_url?: string | null;
 }
 
 interface RelationshipGraphEdgeDto {
@@ -38,9 +39,52 @@ interface TimeScaleDto {
   time_scale: number;
 }
 
+interface WsEventItemDto {
+  id: number;
+  event_type: string;
+  agent_id?: string | null;
+  description?: string;
+  payload?: string;
+  occurred_at?: string;
+}
+
+interface LifeFeedItem {
+  id: number;
+  agentId: string | null;
+  eventType: string;
+  description: string;
+  occurredAt: string;
+  moodLabel: string | null;
+}
+
+interface InspectorDto {
+  agent: {
+    id: string;
+    name: string;
+    avatar_url?: string | null;
+    personality_json?: Record<string, unknown>;
+  };
+  state?: {
+    mood_label: string;
+    valence: number;
+    arousal: number;
+  } | null;
+  recent_events: Array<{
+    id: number;
+    event_type: string;
+    payload?: string;
+  }>;
+  recent_memories: Array<{
+    memory_id: number;
+    content: string;
+    importance: number;
+    created_at: string;
+  }>;
+}
+
 type WsEventsMessage =
-  | { type: 'snapshot'; items: Array<{ id: number; event_type: string; agent_id: string }> }
-  | { type: 'event_appended'; item: { id: number; event_type: string; agent_id: string } }
+  | { type: 'snapshot'; items: WsEventItemDto[] }
+  | { type: 'event_appended'; item: WsEventItemDto }
   | { type: 'tick_skipped'; agent_id: string; reason: string }
   | { type: 'error'; message: string };
 
@@ -120,6 +164,69 @@ const pickTimeScale = (payload: unknown) => {
   return null;
 };
 
+const FEED_LIMIT = 80;
+
+const parseEventPayload = (payload?: string) => {
+  if (!payload || typeof payload !== 'string') return null;
+  const trimmed = payload.trim();
+  if (!trimmed.startsWith('{')) return null;
+  try {
+    return JSON.parse(trimmed) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+};
+
+const extractMoodLabel = (payload?: string) => {
+  const parsed = parseEventPayload(payload);
+  if (!parsed) return null;
+  const directMood = parsed.mood_label;
+  if (typeof directMood === 'string' && directMood.trim().length > 0) return directMood;
+  const emotion = parsed.emotion;
+  if (!emotion || typeof emotion !== 'object') return null;
+  const next = (emotion as Record<string, unknown>).next;
+  if (!next || typeof next !== 'object') return null;
+  const nextMood = (next as Record<string, unknown>).mood_label;
+  return typeof nextMood === 'string' && nextMood.trim().length > 0 ? nextMood : null;
+};
+
+const normalizeFeedItem = (item: WsEventItemDto): LifeFeedItem => ({
+  id: item.id,
+  agentId: item.agent_id ?? null,
+  eventType: item.event_type,
+  description: item.description?.trim() || item.event_type,
+  occurredAt: item.occurred_at ?? new Date().toISOString(),
+  moodLabel: extractMoodLabel(item.payload)
+});
+
+const initials = (name: string) =>
+  name
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => part[0]?.toUpperCase() ?? '')
+    .join('');
+
+const moodMeta = (moodLabel: string | null) => {
+  switch ((moodLabel ?? 'neutral').toLowerCase()) {
+    case 'excited':
+      return { icon: '^', className: 'bg-amber-500/20 text-amber-300 border-amber-400/50' };
+    case 'content':
+    case 'calm':
+      return { icon: 'o', className: 'bg-emerald-500/20 text-emerald-300 border-emerald-400/50' };
+    case 'angry':
+      return { icon: '!', className: 'bg-rose-500/20 text-rose-300 border-rose-400/50' };
+    case 'sad':
+      return { icon: 'v', className: 'bg-blue-500/20 text-blue-300 border-blue-400/50' };
+    case 'anxious':
+      return { icon: '*', className: 'bg-orange-500/20 text-orange-300 border-orange-400/50' };
+    case 'tired':
+      return { icon: '-', className: 'bg-slate-500/20 text-slate-300 border-slate-400/50' };
+    default:
+      return { icon: 'o', className: 'bg-cyan-500/20 text-cyan-300 border-cyan-400/50' };
+  }
+};
+
 const parseStoredActivity = (): ActivityItem[] => {
   try {
     const raw = window.localStorage.getItem(ACTIVITY_STORAGE_KEY);
@@ -134,6 +241,28 @@ const parseStoredActivity = (): ActivityItem[] => {
   } catch {
     return [];
   }
+};
+
+const readDecisionPlan = (events: InspectorDto['recent_events']) => {
+  for (const event of events) {
+    if (event.event_type !== 'agent.tick.executed') continue;
+    const payload = parseEventPayload(event.payload);
+    const pipeline = payload?.decision_pipeline;
+    if (!pipeline || typeof pipeline !== 'object') continue;
+    const record = pipeline as Record<string, unknown>;
+    return {
+      reflection: typeof record.reflection === 'string' ? record.reflection : '',
+      goal: typeof record.goal === 'string' ? record.goal : '',
+      actionPlan: typeof record.action_plan === 'string' ? record.action_plan : '',
+      execution: typeof record.execution === 'string' ? record.execution : ''
+    };
+  }
+  return {
+    reflection: '',
+    goal: '',
+    actionPlan: '',
+    execution: ''
+  };
 };
 
 const SectionHint = ({ text }: { text: string }) => (
@@ -166,6 +295,23 @@ export const ApiSurfaceDashboard = () => {
   const [backendGraphLoaded, setBackendGraphLoaded] = useState(false);
   const [graphNodesLive, setGraphNodesLive] = useState<Graph3DNode[]>([]);
   const [graphEdgesLive, setGraphEdgesLive] = useState<Graph3DEdge[]>([]);
+  const [agentProfiles, setAgentProfiles] = useState<
+    Record<string, { name: string; avatarUrl: string | null }>
+  >({});
+  const [lifeFeed, setLifeFeed] = useState<LifeFeedItem[]>([]);
+  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
+  const [inspectorLoading, setInspectorLoading] = useState(false);
+  const [inspectorData, setInspectorData] = useState<InspectorDto | null>(null);
+  const [inspectorError, setInspectorError] = useState<string | null>(null);
+  const [eventTargetAgentId, setEventTargetAgentId] = useState<string>('');
+  const [eventDescription, setEventDescription] = useState('');
+  const [messageSenderId, setMessageSenderId] = useState('');
+  const [messageReceiverId, setMessageReceiverId] = useState('');
+  const [messageContent, setMessageContent] = useState('');
+  const [controlBusy, setControlBusy] = useState<{ event: boolean; message: boolean }>({
+    event: false,
+    message: false
+  });
   const [activity, setActivity] = useState<ActivityItem[]>(() => {
     const restored = parseStoredActivity();
     if (restored.length > 0) return restored;
@@ -184,8 +330,17 @@ export const ApiSurfaceDashboard = () => {
     setActivity((prev) => [{ id: nextId, text, at: new Date().toLocaleTimeString() }, ...prev]);
   }, []);
 
-  const clearActivity = useCallback(() => {
-    setActivity(() => []);
+  const mergeAgentProfiles = useCallback((nodes: RelationshipGraphNodeDto[]) => {
+    setAgentProfiles((prev) => {
+      const next = { ...prev };
+      for (const node of nodes) {
+        next[node.agent_id] = {
+          name: node.name,
+          avatarUrl: node.avatar_url ?? null
+        };
+      }
+      return next;
+    });
   }, []);
 
   useEffect(() => {
@@ -195,6 +350,17 @@ export const ApiSurfaceDashboard = () => {
       // Ignore storage quota/private mode failures.
     }
   }, [activity]);
+
+  useEffect(() => {
+    if (Object.keys(agentProfiles).length > 0) return;
+    const bootstrap = RELATIONSHIP_GRAPH_3D_NODES.reduce<
+      Record<string, { name: string; avatarUrl: string | null }>
+    >((acc, node) => {
+      acc[node.id] = { name: node.label, avatarUrl: null };
+      return acc;
+    }, {});
+    setAgentProfiles(bootstrap);
+  }, [agentProfiles]);
 
   useEffect(() => {
     const timer = window.setInterval(() => setTimeLabel(new Date().toLocaleTimeString()), 1000);
@@ -320,6 +486,7 @@ export const ApiSurfaceDashboard = () => {
         query: { limit_edges: 300 },
         accessToken
       });
+      mergeAgentProfiles(payload.nodes);
       setGraphNodesLive(mapGraphNodes(payload.nodes));
       setGraphEdgesLive(mapGraphEdges(payload.edges));
       setBackendGraphLoaded(true);
@@ -330,7 +497,7 @@ export const ApiSurfaceDashboard = () => {
       }
       pushActivity(`Graph snapshot failed: ${error instanceof Error ? error.message : 'unknown error'}`);
     }
-  }, [accessToken, backendOnline, pushActivity]);
+  }, [accessToken, backendOnline, mergeAgentProfiles, pushActivity]);
 
   useEffect(() => {
     if (!backendOnline) return;
@@ -365,11 +532,19 @@ export const ApiSurfaceDashboard = () => {
         if (!parsed || typeof parsed !== 'object') return;
         const message = parsed as WsEventsMessage;
         if (message.type === 'snapshot') {
+          const nextFeed = message.items
+            .map(normalizeFeedItem)
+            .sort((left, right) => right.id - left.id)
+            .slice(0, FEED_LIMIT);
+          setLifeFeed(nextFeed);
           pushActivity(`Events snapshot loaded: ${message.items.length}`);
           return;
         }
         if (message.type === 'event_appended') {
-          pushActivity(`Event: ${message.item.event_type} (${message.item.agent_id.slice(0, 8)})`);
+          const nextItem = normalizeFeedItem(message.item);
+          setLifeFeed((prev) => [nextItem, ...prev.filter((item) => item.id !== nextItem.id)].slice(0, FEED_LIMIT));
+          const agentShort = nextItem.agentId ? nextItem.agentId.slice(0, 8) : 'global';
+          pushActivity(`Event: ${nextItem.eventType} (${agentShort})`);
           return;
         }
         if (message.type === 'tick_skipped') {
@@ -429,6 +604,7 @@ export const ApiSurfaceDashboard = () => {
         if (!parsed || typeof parsed !== 'object') return;
         const message = parsed as WsRelationshipsMessage;
         if (message.type === 'snapshot') {
+          mergeAgentProfiles(message.graph.nodes);
           setGraphNodesLive(mapGraphNodes(message.graph.nodes));
           setGraphEdgesLive(mapGraphEdges(message.graph.edges));
           setBackendGraphLoaded(true);
@@ -477,7 +653,7 @@ export const ApiSurfaceDashboard = () => {
       if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
       socket?.close();
     };
-  }, [accessToken, backendOnline, pushActivity, streamStates.relationships]);
+  }, [accessToken, backendOnline, mergeAgentProfiles, pushActivity, streamStates.relationships]);
 
   const filteredEndpoints = useMemo(() => {
     const normalized = search.trim().toLowerCase();
@@ -522,13 +698,167 @@ export const ApiSurfaceDashboard = () => {
     if (showDashboardSkeleton) setActiveCategoryModal(null);
   }, [showDashboardSkeleton]);
 
-  const agentDirectory = useMemo(
-    () => graphNodes.map((node) => ({ id: node.id, name: node.label })),
-    [graphNodes]
+  const agentDirectory = useMemo(() => {
+    const merged = new Map<string, string>();
+    for (const [id, profile] of Object.entries(agentProfiles)) {
+      merged.set(id, profile.name);
+    }
+    for (const node of graphNodes) {
+      if (!merged.has(node.id)) merged.set(node.id, node.label);
+    }
+    return Array.from(merged.entries())
+      .map(([id, name]) => ({ id, name }))
+      .sort((left, right) => left.name.localeCompare(right.name));
+  }, [agentProfiles, graphNodes]);
+
+  const resolveAgentDisplay = useCallback(
+    (agentId: string | null) => {
+      if (!agentId) {
+        return { id: null, name: 'System', avatarUrl: null };
+      }
+      const profile = agentProfiles[agentId];
+      return {
+        id: agentId,
+        name: profile?.name ?? `agent-${agentId.slice(0, 8)}`,
+        avatarUrl: profile?.avatarUrl ?? null
+      };
+    },
+    [agentProfiles]
+  );
+
+  useEffect(() => {
+    if (agentDirectory.length === 0) return;
+    if (!messageSenderId) {
+      setMessageSenderId(agentDirectory[0].id);
+    }
+    if (!messageReceiverId) {
+      const fallbackReceiver =
+        agentDirectory.find((agent) => agent.id !== agentDirectory[0].id)?.id ?? agentDirectory[0].id;
+      setMessageReceiverId(fallbackReceiver);
+    }
+  }, [agentDirectory, messageReceiverId, messageSenderId]);
+
+  const feedPreview = useMemo(() => lifeFeed.slice(0, 14), [lifeFeed]);
+  const decisionPlan = useMemo(
+    () => (inspectorData ? readDecisionPlan(inspectorData.recent_events) : null),
+    [inspectorData]
   );
 
   const activeCategoryLabel = activeCategoryModal ? CATEGORY_LABELS[activeCategoryModal] : undefined;
   const activeCategoryEndpoints = activeCategoryModal ? groupedByCategory[activeCategoryModal] : [];
+
+  const openInspector = useCallback(
+    async (agentId: string) => {
+      setSelectedAgentId(agentId);
+      setInspectorLoading(true);
+      setInspectorError(null);
+      try {
+        const payload = await requestJson<InspectorDto>({
+          path: `/agents/${agentId}/inspector`,
+          query: {
+            events_limit: 20,
+            messages_limit: 10,
+            relationships_limit: 10,
+            timeline_limit: 20,
+            memories_limit: 20,
+            recall_top_k: 8
+          },
+          accessToken
+        });
+        setInspectorData(payload);
+      } catch (error) {
+        if (isBackendUnavailableError(error)) {
+          setBackendOnline(false);
+        }
+        setInspectorData(null);
+        setInspectorError(error instanceof Error ? error.message : 'Failed to load agent inspector');
+      } finally {
+        setInspectorLoading(false);
+      }
+    },
+    [accessToken]
+  );
+
+  const submitQuickEvent = useCallback(async () => {
+    const description = eventDescription.trim();
+    if (!description.length) {
+      pushActivity('Quick event rejected: description is empty');
+      return;
+    }
+
+    setControlBusy((prev) => ({ ...prev, event: true }));
+    try {
+      await requestJson({
+        path: '/interventions',
+        method: 'POST',
+        body: {
+          admin_user_id: session?.user.id ?? 'dashboard-admin',
+          action: {
+            type: 'append_event',
+            agent_id: eventTargetAgentId || null,
+            event_type: 'manual_event',
+            description
+          }
+        },
+        accessToken
+      });
+      setEventDescription('');
+      pushActivity('Manual event added');
+    } catch (error) {
+      if (isBackendUnavailableError(error)) {
+        setBackendOnline(false);
+      }
+      pushActivity(`Manual event failed: ${error instanceof Error ? error.message : 'unknown error'}`);
+    } finally {
+      setControlBusy((prev) => ({ ...prev, event: false }));
+    }
+  }, [accessToken, eventDescription, eventTargetAgentId, pushActivity, session?.user.id]);
+
+  const submitQuickMessage = useCallback(async () => {
+    const content = messageContent.trim();
+    if (!messageSenderId || !messageReceiverId || !content.length) {
+      pushActivity('Quick message rejected: fill sender, receiver and text');
+      return;
+    }
+    if (messageSenderId === messageReceiverId) {
+      pushActivity('Quick message rejected: sender and receiver must be different');
+      return;
+    }
+
+    setControlBusy((prev) => ({ ...prev, message: true }));
+    try {
+      await requestJson({
+        path: '/interventions',
+        method: 'POST',
+        body: {
+          admin_user_id: session?.user.id ?? 'dashboard-admin',
+          action: {
+            type: 'send_message',
+            sender_agent_id: messageSenderId,
+            receiver_agent_id: messageReceiverId,
+            content
+          }
+        },
+        accessToken
+      });
+      setMessageContent('');
+      pushActivity('Message queued');
+    } catch (error) {
+      if (isBackendUnavailableError(error)) {
+        setBackendOnline(false);
+      }
+      pushActivity(`Message send failed: ${error instanceof Error ? error.message : 'unknown error'}`);
+    } finally {
+      setControlBusy((prev) => ({ ...prev, message: false }));
+    }
+  }, [
+    accessToken,
+    messageContent,
+    messageReceiverId,
+    messageSenderId,
+    pushActivity,
+    session?.user.id
+  ]);
 
   return (
     <div className="relative h-screen overflow-hidden p-3 sm:p-4">
@@ -540,7 +870,7 @@ export const ApiSurfaceDashboard = () => {
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
               <h1 className="text-xl font-black text-white sm:text-2xl">CyberLife Control Deck</h1>
-              <p className="text-xs text-slate-300/80">Press `/` search, `G` expand graph, `A` expand activity</p>
+              <p className="text-xs text-slate-300/80">Press `/` search, `G` expand graph, `A` expand feed</p>
             </div>
             <div className="flex items-center gap-2">
               <Badge variant="outline">{filteredEndpoints.length} operations</Badge>
@@ -609,7 +939,7 @@ export const ApiSurfaceDashboard = () => {
                 Expand Graph
               </Button>
               <Button variant="outline" onClick={() => setActivityExpanded(true)}>
-                Expand Activity
+                Expand Feed
               </Button>
             </div>
           </div>
@@ -667,7 +997,7 @@ export const ApiSurfaceDashboard = () => {
                     <h2 className="text-base font-semibold text-white">Relationship Graph</h2>
                     <SectionHint text="Граф связей между агентами. Ребра обновляются в реальном времени." />
                   </div>
-                  <p className="text-xs text-slate-300/80">Drag to rotate. Hover node or edge for details.</p>
+                  <p className="text-xs text-slate-300/80">Click a node to open agent inspector. Full view supports rotate.</p>
                 </div>
                 <Button size="sm" variant="outline" onClick={() => setGraphExpanded(true)}>
                   Full View
@@ -677,6 +1007,9 @@ export const ApiSurfaceDashboard = () => {
                 nodes={graphNodes}
                 edges={graphEdges}
                 interactive={false}
+                onNodeSelect={(agentId) => {
+                  void openInspector(agentId);
+                }}
                 className="dashboard-grid-bg h-[calc(100%-42px)]"
               />
             </GlassCard>
@@ -769,37 +1102,134 @@ export const ApiSurfaceDashboard = () => {
                   </CardContent>
                 </Card>
 
+                <Card className="border-white/10 bg-slate-900/60">
+                  <CardContent className="space-y-3 p-3">
+                    <div className="flex items-center gap-1">
+                      <h3 className="text-sm font-semibold text-white">Control Panel</h3>
+                      <SectionHint text="Быстрые действия: добавить событие и отправить сообщение конкретному агенту." />
+                    </div>
+
+                    <div className="space-y-2">
+                      <Label className="text-xs">Add Event</Label>
+                      <select
+                        value={eventTargetAgentId}
+                        onChange={(event) => setEventTargetAgentId(event.target.value)}
+                        className="h-8 w-full rounded-md border border-white/15 bg-slate-900/70 px-2 text-xs text-slate-100"
+                      >
+                        <option value="">Global event</option>
+                        {agentDirectory.map((agent) => (
+                          <option key={`event-agent-${agent.id}`} value={agent.id} className="bg-slate-950">
+                            {agent.name}
+                          </option>
+                        ))}
+                      </select>
+                      <Input
+                        value={eventDescription}
+                        onChange={(event) => setEventDescription(event.target.value)}
+                        placeholder="Example: Found treasure!"
+                        className="h-8 text-xs"
+                      />
+                      <Button size="sm" onClick={() => void submitQuickEvent()} disabled={controlBusy.event}>
+                        {controlBusy.event ? 'Adding...' : 'Add Event'}
+                      </Button>
+                    </div>
+
+                    <Separator />
+
+                    <div className="space-y-2">
+                      <Label className="text-xs">Send Message</Label>
+                      <div className="grid grid-cols-2 gap-2">
+                        <select
+                          value={messageSenderId}
+                          onChange={(event) => setMessageSenderId(event.target.value)}
+                          className="h-8 rounded-md border border-white/15 bg-slate-900/70 px-2 text-xs text-slate-100"
+                        >
+                          {agentDirectory.map((agent) => (
+                            <option key={`sender-${agent.id}`} value={agent.id} className="bg-slate-950">
+                              {agent.name}
+                            </option>
+                          ))}
+                        </select>
+                        <select
+                          value={messageReceiverId}
+                          onChange={(event) => setMessageReceiverId(event.target.value)}
+                          className="h-8 rounded-md border border-white/15 bg-slate-900/70 px-2 text-xs text-slate-100"
+                        >
+                          {agentDirectory.map((agent) => (
+                            <option key={`receiver-${agent.id}`} value={agent.id} className="bg-slate-950">
+                              {agent.name}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                      <Input
+                        value={messageContent}
+                        onChange={(event) => setMessageContent(event.target.value)}
+                        placeholder="Type message to selected agent"
+                        className="h-8 text-xs"
+                      />
+                      <Button size="sm" onClick={() => void submitQuickMessage()} disabled={controlBusy.message}>
+                        {controlBusy.message ? 'Sending...' : 'Send Message'}
+                      </Button>
+                    </div>
+                  </CardContent>
+                </Card>
+
                 <Separator />
 
                 <div className="min-h-0 flex flex-1 flex-col">
                   <div className="mb-2 flex items-center justify-between">
                     <div className="flex items-center gap-1">
-                      <h3 className="text-sm font-semibold text-white">Activity</h3>
-                      <SectionHint text="Лента действий панели и событий подключения/ошибок в текущей сессии." />
+                      <h3 className="text-sm font-semibold text-white">Life Feed</h3>
+                      <SectionHint text="Лента событий агентов в реальном времени: аватар, имя, тип события, текущее настроение." />
                     </div>
                     <div className="flex gap-1">
                       <Button size="sm" variant="ghost" onClick={() => setActivityExpanded(true)}>
                         Open
                       </Button>
-                      <Button size="sm" variant="ghost" onClick={clearActivity}>
+                      <Button size="sm" variant="ghost" onClick={() => setLifeFeed([])}>
                         Clear
                       </Button>
                     </div>
                   </div>
                   <div className="dashboard-scroll min-h-0 flex-1 space-y-2 overflow-y-auto pr-1">
-                    {activity.length === 0 ? (
+                    {feedPreview.length === 0 ? (
                       <Card className="border-dashed border-white/20 bg-slate-900/50">
-                        <CardContent className="p-3 text-xs text-slate-300/80">No activity yet.</CardContent>
+                        <CardContent className="p-3 text-xs text-slate-300/80">No live events yet.</CardContent>
                       </Card>
                     ) : (
-                      activity.slice(0, 12).map((item) => (
-                        <Card key={item.id} className="border-white/10 bg-slate-900/60">
-                          <CardContent className="space-y-1 p-3">
-                            <p className="text-xs text-slate-100">{item.text}</p>
-                            <p className="text-[11px] text-slate-400">{item.at}</p>
-                          </CardContent>
-                        </Card>
-                      ))
+                      feedPreview.map((item) => {
+                        const agent = resolveAgentDisplay(item.agentId);
+                        const mood = moodMeta(item.moodLabel);
+                        return (
+                          <Card key={`feed-${item.id}`} className="border-white/10 bg-slate-900/60">
+                            <CardContent className="space-y-2 p-3">
+                              <div className="flex items-start justify-between gap-2">
+                                <div className="flex items-center gap-2 min-w-0">
+                                  <button
+                                    type="button"
+                                    className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-white/15 bg-slate-800 text-xs font-bold text-slate-100"
+                                    onClick={() => {
+                                      if (agent.id) void openInspector(agent.id);
+                                    }}
+                                  >
+                                    {initials(agent.name || 'SY')}
+                                  </button>
+                                  <div className="min-w-0">
+                                    <div className="truncate text-xs font-semibold text-slate-100">{agent.name}</div>
+                                    <div className="truncate text-[11px] text-slate-400">{item.eventType}</div>
+                                  </div>
+                                </div>
+                                <span className={cn('rounded border px-2 py-0.5 text-[10px] font-semibold uppercase', mood.className)}>
+                                  {mood.icon} {item.moodLabel ?? 'neutral'}
+                                </span>
+                              </div>
+                              <p className="text-xs text-slate-200">{item.description}</p>
+                              <p className="text-[11px] text-slate-400">{new Date(item.occurredAt).toLocaleTimeString()}</p>
+                            </CardContent>
+                          </Card>
+                        );
+                      })
                     )}
                   </div>
                 </div>
@@ -877,6 +1307,9 @@ export const ApiSurfaceDashboard = () => {
               nodes={graphNodes}
               edges={graphEdges}
               interactive
+              onNodeSelect={(agentId) => {
+                void openInspector(agentId);
+              }}
               className="dashboard-grid-bg h-[calc(92vh-82px)]"
             />
           </GlassCard>
@@ -896,15 +1329,15 @@ export const ApiSurfaceDashboard = () => {
           >
             <div className="mb-3 flex items-center justify-between">
               <div className="flex items-center gap-1">
-                <h3 className="text-lg font-semibold text-white">Full Activity Timeline</h3>
-                <SectionHint text="Полная история действий/событий UI за текущую сессию браузера." />
+                <h3 className="text-lg font-semibold text-white">Full Life Feed</h3>
+                <SectionHint text="Полная лента событий агентов с текущими mood-маркерами." />
               </div>
               <div className="flex gap-2">
                 <Button
                   variant="ghost"
                   onClick={(event) => {
                     event.stopPropagation();
-                    clearActivity();
+                    setLifeFeed([]);
                   }}
                 >
                   Clear
@@ -915,21 +1348,157 @@ export const ApiSurfaceDashboard = () => {
               </div>
             </div>
             <div className="dashboard-scroll min-h-0 flex-1 space-y-2 overflow-y-auto overscroll-contain pr-1">
-              {activity.length === 0 ? (
+              {lifeFeed.length === 0 ? (
                 <Card className="border-dashed border-white/20 bg-slate-900/50">
-                  <CardContent className="p-3 text-sm text-slate-300/80">No activity yet.</CardContent>
+                  <CardContent className="p-3 text-sm text-slate-300/80">No live events yet.</CardContent>
                 </Card>
               ) : (
-                activity.map((item) => (
-                  <Card key={item.id} className="border-white/10 bg-slate-900/60">
-                    <CardContent className="space-y-1 p-3">
-                      <p className="text-sm text-slate-100">{item.text}</p>
-                      <p className="text-xs text-slate-400">{item.at}</p>
-                    </CardContent>
-                  </Card>
-                ))
+                lifeFeed.map((item) => {
+                  const agent = resolveAgentDisplay(item.agentId);
+                  const mood = moodMeta(item.moodLabel);
+                  return (
+                    <Card key={`modal-feed-${item.id}`} className="border-white/10 bg-slate-900/60">
+                      <CardContent className="space-y-2 p-3">
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="flex items-center gap-2 min-w-0">
+                            <button
+                              type="button"
+                              className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-white/15 bg-slate-800 text-xs font-bold text-slate-100"
+                              onClick={() => {
+                                if (agent.id) void openInspector(agent.id);
+                              }}
+                            >
+                              {initials(agent.name || 'SY')}
+                            </button>
+                            <div className="min-w-0">
+                              <div className="truncate text-sm font-semibold text-slate-100">{agent.name}</div>
+                              <div className="truncate text-xs text-slate-400">{item.eventType}</div>
+                            </div>
+                          </div>
+                          <span className={cn('rounded border px-2 py-0.5 text-[10px] font-semibold uppercase', mood.className)}>
+                            {mood.icon} {item.moodLabel ?? 'neutral'}
+                          </span>
+                        </div>
+                        <p className="text-sm text-slate-200">{item.description}</p>
+                        <p className="text-xs text-slate-400">{new Date(item.occurredAt).toLocaleString()}</p>
+                      </CardContent>
+                    </Card>
+                  );
+                })
               )}
             </div>
+          </GlassCard>
+        </div>
+      ) : null}
+
+      {selectedAgentId ? (
+        <div
+          className="fixed inset-0 z-[99] flex items-center justify-center overflow-y-auto bg-black/75 p-4 backdrop-blur-sm"
+          onClick={(event) => {
+            if (event.target === event.currentTarget) {
+              setSelectedAgentId(null);
+              setInspectorData(null);
+              setInspectorError(null);
+            }
+          }}
+        >
+          <GlassCard
+            className="my-auto flex w-[95vw] max-w-[980px] min-h-0 flex-col overflow-hidden p-4"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="mb-3 flex items-center justify-between">
+              <div>
+                <h3 className="text-lg font-semibold text-white">Agent Inspector</h3>
+                <p className="text-xs text-slate-300/80">Profile, memories and current plan</p>
+              </div>
+              <Button
+                variant="ghost"
+                onClick={() => {
+                  setSelectedAgentId(null);
+                  setInspectorData(null);
+                  setInspectorError(null);
+                }}
+              >
+                Close
+              </Button>
+            </div>
+
+            {inspectorLoading ? (
+              <SkeletonCard lines={8} showAvatar className="h-64" />
+            ) : inspectorError ? (
+              <Card className="border-rose-500/40 bg-rose-950/40">
+                <CardContent className="p-4 text-sm text-rose-200">{inspectorError}</CardContent>
+              </Card>
+            ) : inspectorData ? (
+              <div className="dashboard-scroll min-h-0 flex-1 space-y-3 overflow-y-auto pr-1">
+                <Card className="border-white/10 bg-slate-900/60">
+                  <CardContent className="space-y-2 p-4">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-3">
+                        <div className="inline-flex h-10 w-10 items-center justify-center rounded-xl border border-white/15 bg-slate-800 text-sm font-bold text-slate-100">
+                          {initials(inspectorData.agent.name)}
+                        </div>
+                        <div>
+                          <div className="text-sm font-semibold text-white">{inspectorData.agent.name}</div>
+                          <div className="text-xs text-slate-400">{inspectorData.agent.id}</div>
+                        </div>
+                      </div>
+                      <span className={cn('rounded border px-2 py-0.5 text-[10px] font-semibold uppercase', moodMeta(inspectorData.state?.mood_label ?? 'neutral').className)}>
+                        {moodMeta(inspectorData.state?.mood_label ?? 'neutral').icon} {inspectorData.state?.mood_label ?? 'neutral'}
+                      </span>
+                    </div>
+                    <div className="text-xs text-slate-300">
+                      Valence: {inspectorData.state?.valence?.toFixed(2) ?? '0.00'} | Arousal:{' '}
+                      {inspectorData.state?.arousal?.toFixed(2) ?? '0.00'}
+                    </div>
+                  </CardContent>
+                </Card>
+
+                <Card className="border-white/10 bg-slate-900/60">
+                  <CardContent className="space-y-2 p-4">
+                    <div className="text-sm font-semibold text-white">Character</div>
+                    <pre className="overflow-x-auto rounded-md border border-white/10 bg-slate-950/60 p-3 text-xs text-slate-200">
+                      {JSON.stringify(inspectorData.agent.personality_json ?? {}, null, 2)}
+                    </pre>
+                  </CardContent>
+                </Card>
+
+                <Card className="border-white/10 bg-slate-900/60">
+                  <CardContent className="space-y-2 p-4">
+                    <div className="text-sm font-semibold text-white">Current Plan</div>
+                    <div className="space-y-1 text-xs text-slate-200">
+                      <p><span className="text-slate-400">Reflection:</span> {decisionPlan?.reflection || 'n/a'}</p>
+                      <p><span className="text-slate-400">Goal:</span> {decisionPlan?.goal || 'n/a'}</p>
+                      <p><span className="text-slate-400">Action:</span> {decisionPlan?.actionPlan || 'n/a'}</p>
+                      <p><span className="text-slate-400">Execution:</span> {decisionPlan?.execution || 'n/a'}</p>
+                    </div>
+                  </CardContent>
+                </Card>
+
+                <Card className="border-white/10 bg-slate-900/60">
+                  <CardContent className="space-y-2 p-4">
+                    <div className="text-sm font-semibold text-white">Key Memories</div>
+                    <div className="space-y-2">
+                      {inspectorData.recent_memories.slice(0, 8).map((memory) => (
+                        <div key={memory.memory_id} className="rounded-md border border-white/10 bg-slate-950/50 p-3">
+                          <p className="text-xs text-slate-100">{memory.content}</p>
+                          <p className="mt-1 text-[11px] text-slate-400">
+                            importance {memory.importance.toFixed(2)} | {new Date(memory.created_at).toLocaleString()}
+                          </p>
+                        </div>
+                      ))}
+                      {inspectorData.recent_memories.length === 0 ? (
+                        <p className="text-xs text-slate-400">No memories yet.</p>
+                      ) : null}
+                    </div>
+                  </CardContent>
+                </Card>
+              </div>
+            ) : (
+              <Card className="border-dashed border-white/20 bg-slate-900/50">
+                <CardContent className="p-4 text-sm text-slate-300/80">No inspector data.</CardContent>
+              </Card>
+            )}
           </GlassCard>
         </div>
       ) : null}

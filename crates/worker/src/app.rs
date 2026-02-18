@@ -186,6 +186,8 @@ pub async fn run() -> anyhow::Result<()> {
         config.memory.max_active_per_agent,
         config.memory.summary_batch_size,
         config.agent_ids.clone(),
+        MEMORY_SUMMARY_AGENT_SCAN_LIMIT,
+        repository.clone(),
         Arc::clone(&memory_service),
     );
 

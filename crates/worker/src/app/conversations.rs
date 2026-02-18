@@ -351,20 +351,28 @@ async fn load_message_event_context(
             .iter()
             .filter(|event| event.event_type == "manual_event")
             .take(2)
-            .map(|event| format!("world:{}: {}", event.event_type, trim_text(&event.description, 120))),
+            .map(|event| {
+                format!(
+                    "world:{}: {}",
+                    event.event_type,
+                    trim_text(&event.description, 120)
+                )
+            }),
     );
-    lines.extend(
-        sender_events
-            .iter()
-            .take(2)
-            .map(|event| format!("sender:{}: {}", event.event_type, trim_text(&event.description, 120))),
-    );
-    lines.extend(
-        receiver_events
-            .iter()
-            .take(2)
-            .map(|event| format!("receiver:{}: {}", event.event_type, trim_text(&event.description, 120))),
-    );
+    lines.extend(sender_events.iter().take(2).map(|event| {
+        format!(
+            "sender:{}: {}",
+            event.event_type,
+            trim_text(&event.description, 120)
+        )
+    }));
+    lines.extend(receiver_events.iter().take(2).map(|event| {
+        format!(
+            "receiver:{}: {}",
+            event.event_type,
+            trim_text(&event.description, 120)
+        )
+    }));
 
     if lines.is_empty() {
         "none".to_owned()

@@ -14,6 +14,7 @@ export interface RelationshipGraph3DProps {
   edges: Graph3DEdge[];
   interactive?: boolean;
   className?: string;
+  onNodeSelect?: (nodeId: string) => void;
 }
 
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
@@ -22,7 +23,8 @@ export const RelationshipGraph3D = memo(({
   nodes,
   edges,
   interactive = true,
-  className
+  className,
+  onNodeSelect
 }: RelationshipGraph3DProps) => {
   const [yaw, setYaw] = useState(0.9);
   const [pitch, setPitch] = useState(0.42);
@@ -163,6 +165,8 @@ export const RelationshipGraph3D = memo(({
                   fill="rgba(15, 23, 42, 0.85)"
                   stroke={hoveredNodeId === node.id ? 'rgba(186,230,253,1)' : 'rgba(103, 232, 249, 0.9)'}
                   strokeWidth={hoveredNodeId === node.id ? 2.2 : 1.3}
+                  className={onNodeSelect ? 'cursor-pointer' : undefined}
+                  onClick={() => onNodeSelect?.(node.id)}
                   onMouseEnter={() => {
                     if (!interactive) return;
                     if (!isDragging) setHoveredNodeId(node.id);
