@@ -55,6 +55,37 @@ interface ParsedBodyDefaults {
 }
 
 const SYSTEM_MANAGED_BODY_KEYS = new Set(['admin_user_id', 'user_id']);
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const AGENT_ID_KEYS = new Set(['agent_id', 'sender_agent_id', 'receiver_agent_id']);
+
+const isUuid = (value: string) => UUID_PATTERN.test(value.trim());
+
+const findInvalidAgentIdPath = (value: unknown, path = ''): string | null => {
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index += 1) {
+      const nextPath = `${path}[${index}]`;
+      const found = findInvalidAgentIdPath(value[index], nextPath);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  if (!value || typeof value !== 'object') return null;
+  const record = value as Record<string, unknown>;
+
+  for (const [key, nested] of Object.entries(record)) {
+    const nextPath = path ? `${path}.${key}` : key;
+    if (AGENT_ID_KEYS.has(key)) {
+      if (typeof nested !== 'string' || !isUuid(nested)) return nextPath;
+      continue;
+    }
+
+    const found = findInvalidAgentIdPath(nested, nextPath);
+    if (found) return found;
+  }
+
+  return null;
+};
 
 const resolveParamHint = (endpoint: EndpointDefinition, param: EndpointParam) => {
   if (param.key === 'id' && endpoint.path.includes('/agents/{id}')) return 'UUID агента, для которого выполняется операция.';
@@ -501,6 +532,19 @@ const OperationCard = ({
       }, {});
 
     const resolvedPath = resolvePathTemplate(endpoint.path, pathParams);
+    const invalidPathParam = visibleParams.find((param) => {
+      if (!isAgentParam(endpoint, param)) return false;
+      const value = (paramValues[param.key] ?? '').trim();
+      if (!value.length) return false;
+      return !isUuid(value);
+    });
+    if (invalidPathParam) {
+      setLastSummary(null);
+      setLastError(`Поле "${invalidPathParam.label}" должно быть UUID.`);
+      onRun(`${endpoint.title} failed: invalid UUID in ${invalidPathParam.key}`);
+      setIsRunning(false);
+      return;
+    }
 
     try {
       if (endpoint.kind === 'ws') {
@@ -515,14 +559,24 @@ const OperationCard = ({
         setLastError(null);
         onRun(`${endpoint.title} connected via backend WS (${Math.round(performance.now() - started)} ms)`);
       } else {
+        const bodyPayload =
+          endpoint.method === 'POST' && (bodyKeys.length > 0 || hasAutoBodyFields)
+            ? buildRequestBody(bodyFields, resolvedHiddenBodyFields, bodyDefaults.template)
+            : undefined;
+        const invalidBodyPath = bodyPayload ? findInvalidAgentIdPath(bodyPayload) : null;
+        if (invalidBodyPath) {
+          setLastSummary(null);
+          setLastError(`Поле "${invalidBodyPath}" должно быть UUID.`);
+          onRun(`${endpoint.title} failed: invalid UUID in ${invalidBodyPath}`);
+          setIsRunning(false);
+          return;
+        }
+
         const payload = await requestJson<unknown>({
           path: resolvedPath,
           method: endpoint.method,
           query: queryParams,
-          body:
-            endpoint.method === 'POST' && (bodyKeys.length > 0 || hasAutoBodyFields)
-              ? buildRequestBody(bodyFields, resolvedHiddenBodyFields, bodyDefaults.template)
-              : undefined,
+          body: bodyPayload,
           accessToken
         });
 

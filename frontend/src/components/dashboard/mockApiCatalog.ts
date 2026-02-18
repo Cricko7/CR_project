@@ -6,6 +6,13 @@ import type {
 } from './types';
 
 const toJson = (value: unknown) => JSON.stringify(value, null, 2);
+const DEMO_AGENT_A = '11111111-1111-1111-1111-111111111111';
+const DEMO_AGENT_B = '22222222-2222-2222-2222-222222222222';
+const DEMO_AGENT_C = '33333333-3333-4333-8333-333333333333';
+const DEMO_AGENT_D = '44444444-4444-4444-8444-444444444444';
+const DEMO_AGENT_E = '55555555-5555-4555-8555-555555555555';
+const DEMO_AGENT_F = '66666666-6666-4666-8666-666666666666';
+const DEMO_AGENT_G = '77777777-7777-4777-8777-777777777777';
 
 export const CATEGORY_LABELS: Record<EndpointCategory, string> = {
   system: 'System',
@@ -171,8 +178,8 @@ export const API_ENDPOINTS: EndpointDefinition[] = [
       admin_user_id: 'demo-admin',
       action: {
         type: 'send_message',
-        sender_agent_id: 'uuid-agent-a',
-        receiver_agent_id: 'uuid-agent-b',
+        sender_agent_id: DEMO_AGENT_A,
+        receiver_agent_id: DEMO_AGENT_B,
         content: 'Hold position and report status.'
       }
     }),
@@ -245,7 +252,7 @@ export const API_ENDPOINTS: EndpointDefinition[] = [
     summary: 'Queue a direct message to receiver agent.',
     params: [{ key: 'id', label: 'Receiver ID', kind: 'path', defaultValue: 'uuid-agent-b', required: true }],
     defaultBody: toJson({
-      sender_agent_id: 'uuid-agent-a',
+      sender_agent_id: DEMO_AGENT_A,
       content: "Let's cooperate on exploring the market."
     }),
     sampleResponse: toJson({ message_id: 77, status: 'queued' })
@@ -498,24 +505,24 @@ export const API_ENDPOINTS: EndpointDefinition[] = [
 ];
 
 export const RELATIONSHIP_GRAPH_3D_NODES: Graph3DNode[] = [
-  { id: 'uuid-agent-a', label: 'Alice', x: -90, y: -30, z: 90 },
-  { id: 'uuid-agent-b', label: 'Bob', x: 110, y: -25, z: -70 },
-  { id: 'uuid-agent-c', label: 'Eve', x: -45, y: 90, z: -35 },
-  { id: 'uuid-agent-d', label: 'Milo', x: 75, y: 78, z: 50 },
-  { id: 'uuid-agent-e', label: 'Nova', x: 15, y: -95, z: -95 }
+  { id: DEMO_AGENT_A, label: 'Alice', x: -90, y: -30, z: 90 },
+  { id: DEMO_AGENT_B, label: 'Bob', x: 110, y: -25, z: -70 },
+  { id: DEMO_AGENT_C, label: 'Eve', x: -45, y: 90, z: -35 },
+  { id: DEMO_AGENT_D, label: 'Milo', x: 75, y: 78, z: 50 },
+  { id: DEMO_AGENT_E, label: 'Nova', x: 15, y: -95, z: -95 }
 ];
 
 export const AGENT_DIRECTORY = [
   ...RELATIONSHIP_GRAPH_3D_NODES.map((node) => ({ id: node.id, name: node.label })),
-  { id: 'uuid-agent-f', name: 'Iris' },
-  { id: 'uuid-agent-g', name: 'Orion' }
+  { id: DEMO_AGENT_F, name: 'Iris' },
+  { id: DEMO_AGENT_G, name: 'Orion' }
 ];
 
 export const RELATIONSHIP_GRAPH_3D_EDGES: Graph3DEdge[] = [
-  { id: 'edge-1', source: 'uuid-agent-a', target: 'uuid-agent-b', affinity: 0.32 },
-  { id: 'edge-2', source: 'uuid-agent-a', target: 'uuid-agent-c', affinity: 0.74 },
-  { id: 'edge-3', source: 'uuid-agent-c', target: 'uuid-agent-d', affinity: -0.23 },
-  { id: 'edge-4', source: 'uuid-agent-b', target: 'uuid-agent-d', affinity: 0.58 },
-  { id: 'edge-5', source: 'uuid-agent-e', target: 'uuid-agent-a', affinity: 0.19 },
-  { id: 'edge-6', source: 'uuid-agent-e', target: 'uuid-agent-d', affinity: -0.11 }
+  { id: 'edge-1', source: DEMO_AGENT_A, target: DEMO_AGENT_B, affinity: 0.32 },
+  { id: 'edge-2', source: DEMO_AGENT_A, target: DEMO_AGENT_C, affinity: 0.74 },
+  { id: 'edge-3', source: DEMO_AGENT_C, target: DEMO_AGENT_D, affinity: -0.23 },
+  { id: 'edge-4', source: DEMO_AGENT_B, target: DEMO_AGENT_D, affinity: 0.58 },
+  { id: 'edge-5', source: DEMO_AGENT_E, target: DEMO_AGENT_A, affinity: 0.19 },
+  { id: 'edge-6', source: DEMO_AGENT_E, target: DEMO_AGENT_D, affinity: -0.11 }
 ];
